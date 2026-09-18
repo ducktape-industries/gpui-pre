@@ -293,8 +293,8 @@ impl TestWindow {
     }
 
     /// The last accessibility tree update the window sent to this test window.
-    /// A window only builds one while accessibility is active for it; each
-    /// update carries the whole tree.
+    /// A window only builds one while accessibility is active for it (see
+    /// [`crate::Window::activate_a11y`]); each update carries the whole tree.
     pub fn last_a11y_tree_update(&self) -> Option<accesskit::TreeUpdate> {
         self.0.lock().last_a11y_tree_update.clone()
     }

@@ -6675,6 +6675,17 @@ impl Window {
         self.a11y.is_active()
     }
 
+    /// Builds this window's accessibility tree from the next frame on, as if
+    /// assistive technology had connected, and forces that frame.
+    ///
+    /// Tests use this to inspect the tree with no adapter attached. It has no
+    /// effect on an [inaccessible](crate::Application::new_inaccessible)
+    /// application. An adapter's deactivation turns it off again.
+    pub fn activate_a11y(&mut self) {
+        self.a11y.activate();
+        self.refresh();
+    }
+
     /// Debug representation of the last frame's accessibility information.
     pub fn debug_a11y_tree_json(&self) -> Option<String> {
         self.a11y.debug_tree_json()

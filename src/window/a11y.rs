@@ -217,6 +217,11 @@ impl A11y {
         self.active_this_frame
     }
 
+    /// Marks accessibility as requested, as an adapter's activation does.
+    pub(crate) fn activate(&self) {
+        self.active_flag.store(true, Ordering::SeqCst);
+    }
+
     pub(crate) fn set_focusable(&mut self, node_id: NodeId, focus_id: FocusId) {
         self.focus_ids.insert(node_id, focus_id);
     }
