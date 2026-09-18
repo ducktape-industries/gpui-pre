@@ -6691,6 +6691,27 @@ impl Window {
         self.a11y.debug_tree_json()
     }
 
+    /// The whole accessibility tree this window built on its last frame with
+    /// accessibility active (see [`Self::activate_a11y`]), or `None` before one.
+    /// Each update GPUI sends carries the whole tree, so this is the current tree.
+    pub fn a11y_tree(&self) -> Option<&accesskit::TreeUpdate> {
+        self.a11y.last_tree_update()
+    }
+
+    /// The element that built `node` on the last frame with accessibility
+    /// active; `None` for the root and for synthetic children.
+    pub fn a11y_element_id(&self, node: accesskit::NodeId) -> Option<&GlobalElementId> {
+        self.a11y.element_ids.get(&node)
+    }
+
+    /// Performs an accessibility action as if an adapter had requested it:
+    /// the node's own listener if it has one, else GPUI's built-in handling
+    /// (Click synthesized at the node's centre, Focus, Blur).
+    #[cfg(not(target_family = "wasm"))]
+    pub fn dispatch_a11y_action(&mut self, request: accesskit::ActionRequest, cx: &mut App) {
+        self.handle_a11y_action(request, cx);
+    }
+
     /// The last accessibility tree update this window sent to its test
     /// platform window, or `None` on other platforms or before the first
     /// frame built with accessibility active.

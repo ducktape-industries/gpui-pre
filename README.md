@@ -1,12 +1,13 @@
 # gpui-pre (ducktape-industries fork)
 
-**What:** [`gpui-pre` 0.3.5](https://crates.io/crates/gpui-pre/0.3.5) exactly as published on crates.io (first commit), plus three small commits:
+**What:** [`gpui-pre` 0.3.5](https://crates.io/crates/gpui-pre/0.3.5) exactly as published on crates.io (first commit), plus four small commits:
 
 1. `test-support: the test window keeps the last accessibility tree update` — `TestWindow` retains the last AccessKit `TreeUpdate` it is sent; `TestWindow::last_a11y_tree_update` and `Window::last_a11y_tree_update` (test-support only) read it.
 2. `window: a public switch activates accessibility for one window` — `Window::activate_a11y()` builds that window's tree with no assistive technology attached.
 3. `div: an aria_disabled setter on the element accessibility API` — `aria_disabled(bool)` beside `aria_selected`/`aria_expanded`/`aria_toggled`.
+4. `window: read the accessibility tree, its element ids, and dispatch an action at runtime` — `Window::a11y_tree()` (the last `TreeUpdate`, in every build), `Window::a11y_element_id(node)` (the `GlobalElementId` that built a node), `Window::dispatch_a11y_action(request)` (the adapter's own action path). Read-only accessors plus one public entry to the existing handler; nothing changes unless called.
 
-**Why:** ducktape-app #114 gates merges on an accessibility contract (`ax_contract`) that reads every screen's AccessKit tree headless. Without (1) and (2) no headless test can see the tree: the test window dropped it and a window only built it once an adapter activated.
+**Why:** ducktape-app #114 gates merges on an accessibility contract (`ax_contract`) that reads every screen's AccessKit tree headless. Without (1) and (2) no headless test can see the tree: the test window dropped it and a window only built it once an adapter activated. (4) is for the app's opt-in loopback test door, which serves that same tree to a QA runner in a real (release) build and acts through the same path a screen reader does.
 
 **Upstream PR: pending** (zed-industries/zed, `crates/gpui`). The app consumes this fork through `[patch.crates-io]`; the patch goes when upstream lands and gpui-kit takes the release carrying it.
 

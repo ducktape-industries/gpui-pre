@@ -148,6 +148,9 @@ pub(crate) struct A11y {
     pub(crate) nodes: A11yNodeBuilder,
     pub(crate) focus_ids: FxHashMap<NodeId, FocusId>,
     pub(crate) node_bounds: FxHashMap<NodeId, Bounds<Pixels>>,
+    /// The element each node of this frame was built from, so a tool can
+    /// name a node by its element path rather than its hashed [`NodeId`].
+    pub(crate) element_ids: FxHashMap<NodeId, GlobalElementId>,
     pub(crate) action_listeners: FxHashMap<NodeId, Vec<(Action, A11yActionListener)>>,
     /// The window's title, used to label the root node so assistive
     /// technology can tell windows apart.
@@ -176,6 +179,7 @@ impl A11y {
             nodes: A11yNodeBuilder::new(),
             focus_ids: FxHashMap::default(),
             node_bounds: FxHashMap::default(),
+            element_ids: FxHashMap::default(),
             action_listeners: FxHashMap::default(),
             window_title,
             last_focus_without_node: None,
@@ -276,6 +280,7 @@ impl A11y {
     pub(crate) fn begin_frame(&mut self) {
         self.focus_ids.clear();
         self.node_bounds.clear();
+        self.element_ids.clear();
         self.action_listeners.clear();
         self.nodes.begin_frame(self.window_title.as_ref());
     }
@@ -293,6 +298,10 @@ impl A11y {
         #[cfg(debug_assertions)]
         self.debug.capture_node_info(&self.nodes.node_info);
         update
+    }
+
+    pub(crate) fn last_tree_update(&self) -> Option<&TreeUpdate> {
+        self.debug.last_tree_update()
     }
 
     pub(crate) fn debug_tree_json(&self) -> Option<String> {

@@ -91,6 +91,10 @@ impl A11yDebug {
         });
     }
 
+    pub(crate) fn last_tree_update(&self) -> Option<&TreeUpdate> {
+        self.last_tree_update.as_ref()
+    }
+
     #[cfg(debug_assertions)]
     pub(crate) fn capture_node_info(&mut self, node_info: &FxHashMap<NodeId, NodeDebugInfo>) {
         self.last_node_info = node_info.clone();
