@@ -6680,6 +6680,14 @@ impl Window {
         self.a11y.debug_tree_json()
     }
 
+    /// The last accessibility tree update this window sent to its test
+    /// platform window, or `None` on other platforms or before the first
+    /// frame built with accessibility active.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn last_a11y_tree_update(&mut self) -> Option<accesskit::TreeUpdate> {
+        self.platform_window.as_test()?.last_a11y_tree_update()
+    }
+
     /// Register a listener for an accessibility action on a specific node.
     /// The listener will be called when a screen reader requests the given
     /// action on the node identified by `node_id`.
