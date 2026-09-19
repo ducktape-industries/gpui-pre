@@ -9,9 +9,15 @@
 
 **Why:** ducktape-app #114 gates merges on an accessibility contract (`ax_contract`) that reads every screen's AccessKit tree headless. Without (1) and (2) no headless test can see the tree: the test window dropped it and a window only built it once an adapter activated. (4) is for the app's opt-in loopback test door, which serves that same tree to a QA runner in a real (release) build and acts through the same path a screen reader does.
 
-**Upstream PR: pending** (zed-industries/zed, `crates/gpui`). The app consumes this fork through `[patch.crates-io]`; the patch goes when upstream lands and gpui-kit takes the release carrying it.
+**Not upstreamed, by owner decision (2026-09-19).** No PR to zed-industries/zed and no gpui-kit issue; this private fork stays. The app consumes it through `[patch.crates-io]`, pinned by full rev.
 
-### Upstream-ready description
+### Re-applying on a gpui-pre bump
+
+1. Start a branch from the new `gpui-pre` release exactly as published on crates.io (one commit: unpack the `.crate`, nothing else).
+2. `git cherry-pick` the four commits above in order (2bd3361, a28ce2b, 8705c2b, 021b436); conflicts are confined to `src/window.rs`, `src/platform/test/window.rs` and `src/elements/div.rs`.
+3. In ducktape-app, set the new full rev in `[patch.crates-io]`, then run `cargo test ax_contract` and the door tests: they fail if any of the four is missing.
+
+### What the patch does (kept for a future reader)
 
 > **gpui: read the accessibility tree in tests, and switch it on without an adapter**
 >
