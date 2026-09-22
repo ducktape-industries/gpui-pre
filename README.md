@@ -57,8 +57,8 @@ No JavaScript import is replaced with a shim.
   `fastrand/js`, which imports getrandom's browser backend. Native targets
   and `web` retain flume defaults. Browser worker threads imply `web`.
 
-Consumers must patch `gpui-pre`, `gpui-pre-scheduler`, and `gpui-pre-zlog`
-from the same fork revision. The two sibling packages live in `vendor/`;
+Consumers must patch `gpui-pre`, `gpui-pre-scheduler`, `gpui-pre-zlog` and
+`gpui-pre-wgpu` from the same fork revision. The two sibling packages live in `vendor/`;
 `README.ducktape.md` records each original crates.io archive SHA-256. Cargo
 ignores dependency manifests' patch tables, so patches belong in each
 consumer workspace's `[patch.crates-io]` table, not this dependency.
@@ -196,6 +196,13 @@ that implement it are vendored: `vendor/gpui-pre-linux` (X11) and
 their `README.ducktape.md`). Wayland and Windows keep the trait default, which
 only resizes. Consumers patch `gpui-pre-linux` and `gpui-pre-macos` from the
 same revision as `gpui-pre`.
+
+### Linux color emoji
+
+`vendor/gpui-pre-wgpu` is 0.3.5 as published plus one condition in
+`load_family`: a known color emoji face is not removed for lacking a Latin
+`m`. See its `README.ducktape.md`. The app repo's `font_fallback` tests pin
+the behavior.
 
 ### Guest wire size
 
