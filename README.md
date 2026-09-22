@@ -45,8 +45,8 @@ No JavaScript import is replaced with a shim.
   `fastrand/js`, which imports getrandom's browser backend. Native targets
   and `web` retain flume defaults. Browser worker threads imply `web`.
 
-Consumers must patch `gpui-pre`, `gpui-pre-scheduler`, and `gpui-pre-zlog`
-from the same fork revision. The two sibling packages live in `vendor/`;
+Consumers must patch `gpui-pre`, `gpui-pre-scheduler`, `gpui-pre-zlog` and
+`gpui-pre-wgpu` from the same fork revision. The two sibling packages live in `vendor/`;
 `README.ducktape.md` records each original crates.io archive SHA-256. Cargo
 ignores dependency manifests' patch tables, so patches belong in each
 consumer workspace's `[patch.crates-io]` table, not this dependency.
@@ -174,6 +174,13 @@ In addition to the systems above, GPUI provides a range of smaller services that
 - The `[gpui::test]` macro provides a convenient way to write tests for your GPUI applications. Tests also have their own kind of context, a `TestAppContext` which provides ways of simulating common platform input. See `app::test_context` and `test` modules for more details.
 
 Currently, the best way to learn about these APIs is to read the Zed source code or drop a question in the [Zed Discord](https://zed.dev/community-links). We're working on improving the documentation, creating more examples, and will be publishing more guides to GPUI on our [blog](https://zed.dev/blog).
+
+### Linux color emoji
+
+`vendor/gpui-pre-wgpu` is 0.3.5 as published plus one condition in
+`load_family`: a known color emoji face is not removed for lacking a Latin
+`m`. See its `README.ducktape.md`. The app repo's `font_fallback` tests pin
+the behavior.
 
 ### Guest wire size
 
