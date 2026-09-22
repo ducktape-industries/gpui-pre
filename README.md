@@ -166,3 +166,14 @@ In addition to the systems above, GPUI provides a range of smaller services that
 - The `[gpui::test]` macro provides a convenient way to write tests for your GPUI applications. Tests also have their own kind of context, a `TestAppContext` which provides ways of simulating common platform input. See `app::test_context` and `test` modules for more details.
 
 Currently, the best way to learn about these APIs is to read the Zed source code or drop a question in the [Zed Discord](https://zed.dev/community-links). We're working on improving the documentation, creating more examples, and will be publishing more guides to GPUI on our [blog](https://zed.dev/blog).
+
+### Guest wire size
+
+The fork also carries `vendor/rmp-serde` 1.3.1 with shared parser operations and a
+default-off `typed` decoding feature. It is a consumer patch, not a GPUI dependency.
+The view wire enables typed decoding only on wasm; native MessagePack remains
+unrestricted. See its `README.ducktape.md` for the archive checksum, exact accepted
+shapes, unchanged encoding and bump checks. Consumers patch `rmp-serde` to the
+same fork revision alongside the scheduler and logger. Guest builds additionally
+share serialization writers and use a pinned Binaryen optimizer; GPUI itself was
+not the main remaining size contributor after the JS gates removed its exports.
