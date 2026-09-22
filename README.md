@@ -19,6 +19,51 @@
 
 ### What the patch does (kept for a future reader)
 
+## wasm guest without JS
+
+The default-on `web` feature retains browser-backed clocks and randomness.
+Wire-only guests use `default-features = false`; they retain GPUI's real
+`StyleRefinement`, `Styled`, geometry, colors, and serialization types.
+No JavaScript import is replaced with a shim.
+
+- GPUI, scheduler, and zlog select chrono's `serde`, `std`, and `clock`
+  explicitly instead of its defaults. `web` restores `chrono/wasmbind`.
+  Native chrono clocks keep their existing implementations.
+- `web-time` is optional in GPUI and the vendored scheduler. Scheduler exports
+  `std::time::Instant` without `web`; visual tests use this shared export.
+  A bare wasm guest must not call the OS-clock or platform APIs: its host
+  provides timing through its guest protocol. Removing the JS dependency
+  also removes js-sys's JSPI spawn-poll and wasm-bindgen registration code.
+- GPUI's wasm getrandom backend and UUID `js`, `v4`, and `v7` generation
+  features require `web`. Native UUID generation remains enabled by target
+  dependencies. UUID values, serde, and deterministic v5 remain available.
+- GPUI and scheduler use seeded rand generators without OS/thread RNG on a
+  bare wasm target. Native target dependencies retain rand's defaults;
+  `web` restores OS/thread RNG for browser builds.
+- Scheduler disables flume defaults for a guest, retaining its async channel
+  support. Its unused select/eventual-fairness features otherwise enable
+  `fastrand/js`, which imports getrandom's browser backend. Native targets
+  and `web` retain flume defaults. Browser worker threads imply `web`.
+
+Consumers must patch `gpui-pre`, `gpui-pre-scheduler`, and `gpui-pre-zlog`
+from the same fork revision. The two sibling packages live in `vendor/`;
+`README.ducktape.md` records each original crates.io archive SHA-256. Cargo
+ignores dependency manifests' patch tables, so patches belong in each
+consumer workspace's `[patch.crates-io]` table, not this dependency.
+
+On a gpui-pre bump, refresh these two sibling sources and archive hashes,
+reapply the dependency feature/target gates and scheduler Instant cfg,
+and preserve the existing accessibility changes. Inspect the full wasm
+normal dependency tree for wasm-bindgen, js-sys, and web-sys; transitive
+feature unification can re-enable a browser path. Rebuild all four release
+views and require the exact guest ABI (only `ducktape_view.panicked`, only
+`alloc/init/tick/snapshot/restore` function exports), then run native app and
+SDK gates. Compare sizes and retained functions before calling the bump
+complete; importing a browser crate is an ABI change even if Rust APIs
+remain compatible.
+
+### Upstream-ready description
+
 > **gpui: read the accessibility tree in tests, and switch it on without an adapter**
 >
 > Today a window builds its AccessKit tree only after the platform adapter's activation callback fires, i.e. only with a screen reader attached, and `TestWindow` ignores `a11y_tree_update`. So no test (and no in-process tool) can inspect the tree GPUI builds.
@@ -129,3 +174,14 @@ In addition to the systems above, GPUI provides a range of smaller services that
 - The `[gpui::test]` macro provides a convenient way to write tests for your GPUI applications. Tests also have their own kind of context, a `TestAppContext` which provides ways of simulating common platform input. See `app::test_context` and `test` modules for more details.
 
 Currently, the best way to learn about these APIs is to read the Zed source code or drop a question in the [Zed Discord](https://zed.dev/community-links). We're working on improving the documentation, creating more examples, and will be publishing more guides to GPUI on our [blog](https://zed.dev/blog).
+
+### Guest wire size
+
+The fork also carries `vendor/rmp-serde` 1.3.1 with shared parser operations and a
+default-off `typed` decoding feature. It is a consumer patch, not a GPUI dependency.
+The view wire enables typed decoding only on wasm; native MessagePack remains
+unrestricted. See its `README.ducktape.md` for the archive checksum, exact accepted
+shapes, unchanged encoding and bump checks. Consumers patch `rmp-serde` to the
+same fork revision alongside the scheduler and logger. Guest builds additionally
+share serialization writers and use a pinned Binaryen optimizer; GPUI itself was
+not the main remaining size contributor after the JS gates removed its exports.
