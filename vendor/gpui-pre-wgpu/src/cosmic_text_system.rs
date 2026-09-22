@@ -372,7 +372,9 @@ impl CosmicTextSystemState {
                 "Segoe Fluent Icons",
             ];
 
+            // Color emoji faces intentionally have no Latin glyphs.
             if font.as_swash().charmap().map('m') == 0
+                && !check_is_known_emoji_font(&postscript_name)
                 && !allowed_bad_font_names.contains(&postscript_name.as_str())
             {
                 self.font_system.db_mut().remove_face(font.id());
