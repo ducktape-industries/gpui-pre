@@ -11,6 +11,49 @@
 
 **Upstream PR: pending** (zed-industries/zed, `crates/gpui`). The app consumes this fork through `[patch.crates-io]`; the patch goes when upstream lands and gpui-kit takes the release carrying it.
 
+## wasm guest without JS
+
+The default-on `web` feature retains browser-backed clocks and randomness.
+Wire-only guests use `default-features = false`; they retain GPUI's real
+`StyleRefinement`, `Styled`, geometry, colors, and serialization types.
+No JavaScript import is replaced with a shim.
+
+- GPUI, scheduler, and zlog select chrono's `serde`, `std`, and `clock`
+  explicitly instead of its defaults. `web` restores `chrono/wasmbind`.
+  Native chrono clocks keep their existing implementations.
+- `web-time` is optional in GPUI and the vendored scheduler. Scheduler exports
+  `std::time::Instant` without `web`; visual tests use this shared export.
+  A bare wasm guest must not call the OS-clock or platform APIs: its host
+  provides timing through its guest protocol. Removing the JS dependency
+  also removes js-sys's JSPI spawn-poll and wasm-bindgen registration code.
+- GPUI's wasm getrandom backend and UUID `js`, `v4`, and `v7` generation
+  features require `web`. Native UUID generation remains enabled by target
+  dependencies. UUID values, serde, and deterministic v5 remain available.
+- GPUI and scheduler use seeded rand generators without OS/thread RNG on a
+  bare wasm target. Native target dependencies retain rand's defaults;
+  `web` restores OS/thread RNG for browser builds.
+- Scheduler disables flume defaults for a guest, retaining its async channel
+  support. Its unused select/eventual-fairness features otherwise enable
+  `fastrand/js`, which imports getrandom's browser backend. Native targets
+  and `web` retain flume defaults. Browser worker threads imply `web`.
+
+Consumers must patch `gpui-pre`, `gpui-pre-scheduler`, and `gpui-pre-zlog`
+from the same fork revision. The two sibling packages live in `vendor/`;
+`README.ducktape.md` records each original crates.io archive SHA-256. Cargo
+ignores dependency manifests' patch tables, so patches belong in each
+consumer workspace's `[patch.crates-io]` table, not this dependency.
+
+On a gpui-pre bump, refresh these two sibling sources and archive hashes,
+reapply the dependency feature/target gates and scheduler Instant cfg,
+and preserve the existing accessibility changes. Inspect the full wasm
+normal dependency tree for wasm-bindgen, js-sys, and web-sys; transitive
+feature unification can re-enable a browser path. Rebuild all four release
+views and require the exact guest ABI (only `ducktape_view.panicked`, only
+`alloc/init/tick/snapshot/restore` function exports), then run native app and
+SDK gates. Compare sizes and retained functions before calling the bump
+complete; importing a browser crate is an ABI change even if Rust APIs
+remain compatible.
+
 ### Upstream-ready description
 
 > **gpui: read the accessibility tree in tests, and switch it on without an adapter**

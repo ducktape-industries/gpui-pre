@@ -57,10 +57,22 @@ bench-support = [
     "dep:criterion",
 ]
 default = [
+    "web",
     "font-kit",
     "wayland",
     "x11",
     "windows-manifest",
+]
+web = [
+    "chrono/wasmbind",
+    "dep:web-time",
+    "scheduler/web",
+    "dep:getrandom",
+    "rand/os_rng",
+    "rand/thread_rng",
+    "uuid/js",
+    "uuid/v4",
+    "uuid/v7",
 ]
 inspector = ["gpui_macros/inspector"]
 leak-detection = ["backtrace"]
@@ -279,7 +291,8 @@ version = "2.6.0"
 
 [dependencies.chrono]
 version = "0.4"
-features = ["serde"]
+default-features = false
+features = ["serde", "clock", "std"]
 
 [dependencies.collections]
 version = "=0.3.5"
@@ -408,6 +421,8 @@ package = "proptest"
 
 [dependencies.rand]
 version = "0.9"
+default-features = false
+features = ["std", "std_rng", "small_rng"]
 
 [dependencies.raw-window-handle]
 version = "0.6"
@@ -431,6 +446,7 @@ default-features = false
 
 [dependencies.scheduler]
 version = "=0.3.5"
+default-features = false
 package = "gpui-pre-scheduler"
 
 [dependencies.schemars]
@@ -504,18 +520,21 @@ package = "gpui-pre-util-macros"
 
 [dependencies.uuid]
 version = "1.1.2"
-features = [
-    "v4",
-    "v5",
-    "v7",
-    "serde",
-]
+features = ["v5", "serde"]
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies.uuid]
+version = "1.1.2"
+features = ["v4", "v7"]
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies.rand]
+version = "0.9"
 
 [dependencies.waker-fn]
 version = "1.2.0"
 
 [dependencies.web-time]
 version = "1.1.0"
+optional = true
 
 [dependencies.ztracing]
 version = "=0.3.5"
@@ -541,16 +560,7 @@ version = "2.5.0"
 [target.'cfg(target_family = "wasm")'.dependencies.getrandom]
 version = "0.3.4"
 features = ["wasm_js"]
-
-[target.'cfg(target_family = "wasm")'.dependencies.uuid]
-version = "1.1.2"
-features = [
-    "v4",
-    "v5",
-    "v7",
-    "serde",
-    "js",
-]
+optional = true
 
 [target.'cfg(target_os = "macos")'.dependencies.core-video]
 version = "0.5.2"
