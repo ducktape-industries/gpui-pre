@@ -17,6 +17,10 @@
 2. `git cherry-pick` the four commits above in order (2bd3361, a28ce2b, 8705c2b, 021b436); conflicts are confined to `src/window.rs`, `src/platform/test/window.rs` and `src/elements/div.rs`.
 3. In ducktape-app, set the new full rev in `[patch.crates-io]`, then run `cargo test ax_contract` and the door tests: they fail if any of the four is missing.
 
+### Link wrapping
+
+`LineWrapper::wrap_line` breaks links sensibly: never inside or right after `scheme://`, not in the authority, and after `/`, `-` or `.` in the path; in prose a `/` breaks after itself rather than before (`and/` | `or`). Upstream broke before every `/`, so `duck://a-b/c` wrapped as `duck:/` | `/a-b/c`. `test_wrap_link` pins it.
+
 ### What the patch does (kept for a future reader)
 
 ## wasm guest without JS
