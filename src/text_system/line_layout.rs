@@ -203,6 +203,8 @@ impl LineLayout {
         };
         let mut last_boundary_x = px(0.);
         let mut prev_ch = '\0';
+        let mut link = super::line_wrapper::Link::Text;
+        let mut link_prev = ('\0', '\0');
         let mut glyphs = self
             .runs
             .iter()
@@ -226,7 +228,15 @@ impl LineLayout {
 
             // Here is very similar to `LineWrapper::wrap_line` to determine text wrapping,
             // but there are some differences, so we have to duplicate the code here.
-            if LineWrapper::is_word_char(ch) {
+            let breaks;
+            (breaks, link) = LineWrapper::link_break(link, link_prev, ch);
+            link_prev = (link_prev.1, ch);
+            if let Some(breaks) = breaks {
+                if breaks && first_non_whitespace_ix.is_some() {
+                    last_candidate_ix = Some(boundary);
+                    last_candidate_x = x;
+                }
+            } else if LineWrapper::is_word_char(ch) {
                 if prev_ch == ' ' && ch != ' ' && first_non_whitespace_ix.is_some() {
                     last_candidate_ix = Some(boundary);
                     last_candidate_x = x;
@@ -1053,6 +1063,32 @@ mod tests {
             .iter()
             .map(|g| f32::from(g.position.x))
             .collect()
+    }
+
+    #[test]
+    fn test_wrap_boundaries_keep_links_whole_until_their_path() {
+        // one 10px glyph per ASCII char, as the shaper lays a monospace line
+        let lines = |text: &str, wrap: f32| {
+            let mut layout =
+                make_layout((0..text.len()).map(|ix| glyph_at(ix as f32 * 10., ix)).collect());
+            layout.width = px(text.len() as f32 * 10.);
+            let mut start = 0;
+            let mut lines = Vec::new();
+            for boundary in layout.compute_wrap_boundaries(text, px(wrap), None) {
+                lines.push(text[start..boundary.glyph_ix].to_string());
+                start = boundary.glyph_ix;
+            }
+            lines.push(text[start..].to_string());
+            lines
+        };
+        assert_eq!(
+            lines("see duck://testkit-1a1ffc41/explorer/tx-00ff", 300.),
+            ["see duck://testkit-1a1ffc41/", "explorer/tx-00ff"]
+        );
+        assert_eq!(
+            lines("see duck://testkit-1a1ffc41/explorer/tx-00ff", 250.),
+            ["see ", "duck://testkit-1a1ffc41/", "explorer/tx-00ff"]
+        );
     }
 
     #[test]

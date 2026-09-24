@@ -15,7 +15,7 @@ pub enum TruncateFrom {
 
 /// Where a line is within a link (`scheme://authority/path`), for wrapping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Link {
+pub(crate) enum Link {
     /// Not in a link, or in its scheme: a `/` breaks after itself.
     Text,
     /// Past `://`, before the authority's end: nothing breaks.
@@ -474,7 +474,7 @@ impl LineWrapper {
     /// slash on the first line; `scheme://authority` never breaks (not
     /// inside `://`, not right after it); a link's path breaks after `/`,
     /// `-` and `.`.
-    fn link_break(link: Link, (before, prev): (char, char), c: char) -> (Option<bool>, Link) {
+    pub(crate) fn link_break(link: Link, (before, prev): (char, char), c: char) -> (Option<bool>, Link) {
         if c.is_whitespace() {
             return (None, Link::Text);
         }
