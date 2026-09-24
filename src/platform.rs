@@ -899,6 +899,16 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
         false
     }
     fn resize(&mut self, size: Size<Pixels>);
+    /// Moves and resizes the window's outer frame, in the coordinates
+    /// [`Self::bounds`] reports. A maximized or fullscreen window should
+    /// leave that state first, or the window manager may override this.
+    ///
+    /// The default only resizes: Wayland clients can't position their own
+    /// windows, so there (and on any backend without an override) the
+    /// compositor keeps choosing where the window sits.
+    fn set_bounds(&mut self, bounds: Bounds<Pixels>) {
+        self.resize(bounds.size);
+    }
     fn scale_factor(&self) -> f32;
     fn appearance(&self) -> WindowAppearance;
     fn display(&self) -> Option<Rc<dyn PlatformDisplay>>;
