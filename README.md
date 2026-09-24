@@ -19,7 +19,7 @@
 
 ### Link wrapping
 
-`LineWrapper::wrap_line` breaks links sensibly: never inside or right after `scheme://`, not in the authority, and after `/`, `-` or `.` in the path; in prose a `/` breaks after itself rather than before (`and/` | `or`). Upstream broke before every `/`, so `duck://a-b/c` wrapped as `duck:/` | `/a-b/c`. `test_wrap_link` pins it.
+`LineWrapper::wrap_line` and `LineLayout::compute_wrap_boundaries` (what laid-out text such as `StyledText` wraps with) break links sensibly: never inside or right after `scheme://`, not in the authority, and after `/`, `-` or `.` in the path; in prose a `/` breaks after itself rather than before (`and/` | `or`). Upstream broke before every `/`, so `duck://a-b/c` wrapped as `duck:/` | `/a-b/c`. `test_wrap_link` and `test_wrap_boundaries_keep_links_whole_until_their_path` pin it.
 
 ### What the patch does (kept for a future reader)
 
