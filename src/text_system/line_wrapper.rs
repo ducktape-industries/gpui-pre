@@ -13,6 +13,17 @@ pub enum TruncateFrom {
     Middle,
 }
 
+/// Where a line is within a link (`scheme://authority/path`), for wrapping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Link {
+    /// Not in a link, or in its scheme: a `/` breaks after itself.
+    Text,
+    /// Past `://`, before the authority's end: nothing breaks.
+    Head,
+    /// The path: breaks after `/`, `-` and `.`.
+    Path,
+}
+
 /// The GPUI line wrapper, used to wrap lines of text to a given width.
 pub struct LineWrapper {
     text_system: Arc<TextSystem>,
@@ -49,6 +60,8 @@ impl LineWrapper {
         let mut last_candidate_width = px(0.);
         let mut last_wrap_ix = 0;
         let mut prev_c = '\0';
+        let mut link = Link::Text;
+        let mut link_prev = ('\0', '\0');
         let mut index = 0;
         let mut candidates = fragments
             .iter()
@@ -65,7 +78,15 @@ impl LineWrapper {
                             continue;
                         }
 
-                        if Self::is_word_char(c) {
+                        let breaks;
+                        (breaks, link) = Self::link_break(link, link_prev, c);
+                        link_prev = (link_prev.1, c);
+                        if let Some(breaks) = breaks {
+                            if breaks && first_non_whitespace_ix.is_some() {
+                                last_candidate_ix = ix;
+                                last_candidate_width = width;
+                            }
+                        } else if Self::is_word_char(c) {
                             if prev_c == ' ' && c != ' ' && first_non_whitespace_ix.is_some() {
                                 last_candidate_ix = ix;
                                 last_candidate_width = width;
@@ -447,6 +468,28 @@ impl LineWrapper {
 
     /// Any character in this list should be treated as a word character,
     /// meaning it can be part of a word that should not be wrapped.
+    /// Whether a line may break before `c`, where a link decides it
+    /// (`None` leaves it to [`Self::is_word_char`]), and the link state
+    /// after `c`. A `/` breaks after itself, not before, so `a/b` keeps its
+    /// slash on the first line; `scheme://authority` never breaks (not
+    /// inside `://`, not right after it); a link's path breaks after `/`,
+    /// `-` and `.`.
+    fn link_break(link: Link, (before, prev): (char, char), c: char) -> (Option<bool>, Link) {
+        if c.is_whitespace() {
+            return (None, Link::Text);
+        }
+        if (before, prev, c) == (':', '/', '/') {
+            return (Some(false), Link::Head);
+        }
+        match link {
+            Link::Head => (Some(false), if c == '/' { Link::Path } else { Link::Head }),
+            _ if c == '/' => (Some(prev.is_whitespace()), link),
+            Link::Path if matches!(prev, '/' | '-' | '.') => (Some(true), link),
+            Link::Text if prev == '/' => (Some(true), link),
+            _ => (None, link),
+        }
+    }
+
     pub(crate) fn is_word_char(c: char) -> bool {
         // ASCII alphanumeric characters, for English, numbers: `Hello123`, etc.
         c.is_ascii_alphanumeric() ||
@@ -861,6 +904,48 @@ mod tests {
                 )
                 .collect::<Vec<_>>(),
             &[Boundary::new(12, 0),], // special chars above take up 3, 2 and 3 bytes, so boundary ends up at 12
+        );
+    }
+
+    #[test]
+    fn test_wrap_link() {
+        let mut wrapper = build_wrapper();
+        let lines = |wrapper: &mut LineWrapper, text: &str, width: f32| {
+            let mut start = 0;
+            let mut lines = Vec::new();
+            for boundary in wrapper.wrap_line(&[LineFragment::text(text)], px(width)) {
+                lines.push(text[start..boundary.ix].to_string());
+                start = boundary.ix;
+            }
+            lines.push(text[start..].to_string());
+            lines
+        };
+        // never inside or right after `duck://`; the authority stays whole,
+        // the path breaks after `/`, `-` or `.`
+        assert_eq!(
+            lines(
+                &mut wrapper,
+                "duck://testkit-1a1ffc41/explorer/tx-00ff.bin",
+                280.
+            ),
+            ["duck://testkit-1a1ffc41/", "explorer/tx-00ff.bin"]
+        );
+        assert_eq!(
+            lines(
+                &mut wrapper,
+                "duck://testkit-1a1ffc41/explorer/tx-00ff.bin",
+                200.
+            ),
+            ["duck://testkit-1a1ff", "c41/explorer/tx-", "00ff.bin"]
+        );
+        assert_eq!(
+            lines(&mut wrapper, "see duck://testkit/explorer", 150.),
+            ["see ", "duck://testkit/", "explorer"]
+        );
+        // prose: a slash stays on the line it ends, `3.14` and `a-b` hold
+        assert_eq!(
+            lines(&mut wrapper, "and/or 3.14", 50.),
+            ["and/", "or ", "3.14"]
         );
     }
 
