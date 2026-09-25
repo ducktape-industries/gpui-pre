@@ -3043,6 +3043,9 @@ extern "C" fn window_did_exit_fullscreen(this: &Object, _: Sel, _: id) {
     // WINDOW_STATE_IVAR with an Arc<Mutex<MacWindowState>> during window creation.
     let window_state = unsafe { get_window_state(this) };
     window_state.as_ref().lock().move_traffic_light();
+    // the frame is final only now, after the animation: a bounds observer
+    // waiting to leave full screen hears it here
+    report_moved(&window_state);
 }
 
 pub(crate) fn is_macos_version_at_least(version: NSOperatingSystemVersion) -> bool {
@@ -3061,6 +3064,10 @@ fn ns_error_description(error: id) -> String {
 
 extern "C" fn window_did_move(this: &Object, _: Sel, _: id) {
     let window_state = unsafe { get_window_state(this) };
+    report_moved(&window_state);
+}
+
+fn report_moved(window_state: &Arc<Mutex<MacWindowState>>) {
     let mut lock = window_state.as_ref().lock();
     if let Some(mut callback) = lock.moved_callback.take() {
         drop(lock);

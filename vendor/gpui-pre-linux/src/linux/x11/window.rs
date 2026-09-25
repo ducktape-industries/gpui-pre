@@ -1064,7 +1064,22 @@ impl X11WindowStatePtr {
     pub fn property_notify(&self, event: xproto::PropertyNotifyEvent) -> anyhow::Result<()> {
         let state = self.state.borrow_mut();
         if event.atom == state.atoms._NET_WM_STATE {
+            let full = |state: &X11WindowState| {
+                (
+                    state.fullscreen,
+                    state.maximized_vertical && state.maximized_horizontal,
+                )
+            };
+            let was = full(&state);
             self.set_wm_properties(state)?;
+            // the frame that goes with a new full-size state can arrive before
+            // it (a ConfigureNotify ahead of this PropertyNotify), so a bounds
+            // observer hears the state change too
+            if full(&self.state.borrow()) != was
+                && let Some(ref mut fun) = self.callbacks.borrow_mut().moved
+            {
+                fun();
+            }
         } else if event.atom == state.atoms._GTK_EDGE_CONSTRAINTS {
             self.set_edge_constraints(state)?;
         }
