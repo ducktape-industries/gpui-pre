@@ -1104,6 +1104,8 @@ impl WaylandWindowStatePtr {
 
                 if let Some(mut configure) = state.in_progress_configure.take() {
                     let got_unmaximized = state.maximized && !configure.maximized;
+                    let full_changed = (state.fullscreen, state.maximized)
+                        != (configure.fullscreen, configure.maximized);
                     state.fullscreen = configure.fullscreen;
                     state.maximized = configure.maximized;
                     state.tiling = configure.tiling;
@@ -1140,6 +1142,14 @@ impl WaylandWindowStatePtr {
                     }
                     if let Some(size) = configure.size {
                         self.resize(size);
+                    }
+                    // a configure that changes only the state carries no size
+                    if full_changed {
+                        let callback = self.callbacks.borrow_mut().moved.take();
+                        if let Some(mut fun) = callback {
+                            fun();
+                            self.callbacks.borrow_mut().moved = Some(fun);
+                        }
                     }
                 }
             }
