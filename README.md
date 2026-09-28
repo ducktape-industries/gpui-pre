@@ -21,6 +21,14 @@
 
 `LineWrapper::wrap_line` and `LineLayout::compute_wrap_boundaries` (what laid-out text such as `StyledText` wraps with) break links sensibly: never inside or right after `scheme://`, not in the authority, and after `/`, `-` or `.` in the path; in prose a `/` breaks after itself rather than before (`and/` | `or`). Upstream broke before every `/`, so `duck://a-b/c` wrapped as `duck:/` | `/a-b/c`. `test_wrap_link` and `test_wrap_boundaries_keep_links_whole_until_their_path` pin it.
 
+### One tab stop per focus handle
+
+`TabStopMap::insert` keeps one entry per focus handle per frame: the first, which is the outermost element's (a div inserts its own handle before its children paint). Upstream kept every insert in the order and the last in its lookup, so a field whose labelled wrapper tracks the input's own handle held two stops, and `focus_prev` from the field landed on its other entry: Shift+Tab never left it. The skipped insert is still recorded, so a cached element's replayed range keeps the stop when nothing outside it tracks the handle. `test_one_tab_stop_per_focus_handle` pins it.
+
+### Refused accessibility nodes
+
+`Window::a11y_refused_elements()` lists the elements whose accessibility node the last frame with accessibility active left out because an earlier node had the same id, each with that shared `NodeId`, so `a11y_element_id(id)` names the element that kept it. A debug build still panics on the duplicate, so the list is empty there; a release build dropped such a node without a trace, and this lets the app's test door report it. `a_second_element_with_one_id_is_refused` pins it (run it with `--release`).
+
 ### What the patch does (kept for a future reader)
 
 ## wasm guest without JS

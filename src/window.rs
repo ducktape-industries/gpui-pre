@@ -6711,6 +6711,15 @@ impl Window {
         self.a11y.element_ids.get(&node)
     }
 
+    /// The elements whose accessibility node the last frame with accessibility
+    /// active refused, each with the node id it shared with an earlier node,
+    /// in paint order. Such a node is left out of the tree.
+    ///
+    /// Always empty in a debug build, which panics on the duplicate first.
+    pub fn a11y_refused_elements(&self) -> &[(accesskit::NodeId, GlobalElementId)] {
+        self.a11y.refused_elements()
+    }
+
     /// Performs an accessibility action as if an adapter had requested it:
     /// the node's own listener if it has one, else GPUI's built-in handling
     /// (Click synthesized at the node's centre, Focus, Blur).
