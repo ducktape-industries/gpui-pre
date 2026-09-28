@@ -701,9 +701,11 @@ mod tests {
         GlobalElementId(Arc::from([ElementId::Name(name.into())]))
     }
 
-    #[cfg(not(debug_assertions))]
+    // A second element with an id already used this frame: panic in debug; in
+    // release its node is left out and the element is recorded as refused.
     #[test]
-    fn a_second_element_with_one_id_is_recorded_as_refused() {
+    #[cfg_attr(debug_assertions, should_panic(expected = "Duplicate a11y node id"))]
+    fn a_second_element_with_one_id_is_refused() {
         let mut a11y = new_a11y();
         let id = NodeId(1);
         let (first, second) = (element("first"), element("second"));
@@ -717,18 +719,6 @@ mod tests {
 
         a11y.begin_frame();
         assert!(a11y.refused_elements().is_empty());
-    }
-
-    #[cfg(debug_assertions)]
-    #[test]
-    #[should_panic(expected = "Duplicate a11y node id")]
-    fn a_second_element_with_one_id_panics_in_a_debug_build() {
-        let mut a11y = new_a11y();
-        let id = NodeId(1);
-
-        assert!(a11y.push_element(id, test_node(), &element("first")));
-        a11y.nodes.pop();
-        a11y.push_element(id, test_node(), &element("second"));
     }
 
     #[test]
