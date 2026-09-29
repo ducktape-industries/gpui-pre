@@ -107,6 +107,8 @@ use accesskit::{Action, NodeId, TreeUpdate};
 use collections::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 use std::hash::{Hash, Hasher};
+use std::mem;
+use std::ops::Range;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -118,6 +120,28 @@ pub(crate) const ROOT_NODE_ID: NodeId = NodeId(0);
 /// A listener for an accessibility action on a specific node.
 pub(crate) type A11yActionListener =
     Box<dyn FnMut(Option<&accesskit::ActionData>, &mut Window, &mut App) + 'static>;
+
+/// What the last drawn frame built, kept for cache reuse.
+///
+/// [`A11y::begin_frame`] moves the live per-frame maps here at the start of
+/// the next frame (not at its end: the live maps are read between frames by
+/// [`crate::Window::a11y_element_id`] and action dispatch). A cached view
+/// whose prepaint is reused copies its nodes and side entries back out of
+/// here by log range, see [`A11y::reuse_range`].
+#[derive(Default)]
+pub(crate) struct RenderedA11y {
+    /// `(parent, id, node)` in pop order, as [`A11yNodeBuilder::log`].
+    log: Vec<(NodeId, NodeId, accesskit::Node)>,
+    focus_ids: FxHashMap<NodeId, FocusId>,
+    node_bounds: FxHashMap<NodeId, Bounds<Pixels>>,
+    element_ids: FxHashMap<NodeId, GlobalElementId>,
+    action_listeners: FxHashMap<NodeId, Vec<(Action, A11yActionListener)>>,
+    focus: Option<NodeId>,
+    active_descendant: Option<NodeId>,
+    /// The previous draw ran `begin_frame` and `end_frame`, so `log` is the
+    /// tree the prepaint ranges of that frame index into.
+    pub(crate) built: bool,
+}
 
 /// Per-window accessibility state.
 ///
@@ -155,6 +179,7 @@ pub(crate) struct A11y {
     /// already had the same id, in paint order.
     refused: Vec<(NodeId, GlobalElementId)>,
     pub(crate) action_listeners: FxHashMap<NodeId, Vec<(Action, A11yActionListener)>>,
+    pub(crate) rendered: RenderedA11y,
     /// The window's title, used to label the root node so assistive
     /// technology can tell windows apart.
     window_title: Option<SharedString>,
@@ -185,6 +210,7 @@ impl A11y {
             element_ids: FxHashMap::default(),
             refused: Vec::new(),
             action_listeners: FxHashMap::default(),
+            rendered: RenderedA11y::default(),
             window_title,
             last_focus_without_node: None,
             debug: debug::A11yDebug::default(),
@@ -312,14 +338,97 @@ impl A11y {
         &self.refused
     }
 
-    /// Clear per-frame state and push the root node to start a new frame.
+    /// Hand the last frame's state to [`Self::rendered`], clear the rest and
+    /// push the root node to start a new frame.
     pub(crate) fn begin_frame(&mut self) {
-        self.focus_ids.clear();
-        self.node_bounds.clear();
-        self.element_ids.clear();
+        self.rendered.focus_ids = mem::take(&mut self.focus_ids);
+        self.rendered.node_bounds = mem::take(&mut self.node_bounds);
+        self.rendered.element_ids = mem::take(&mut self.element_ids);
+        self.rendered.action_listeners = mem::take(&mut self.action_listeners);
+        self.rendered.log = mem::take(&mut self.nodes.log);
+        self.rendered.focus = self.nodes.focus;
+        self.rendered.active_descendant = self.nodes.active_descendant;
         self.refused.clear();
-        self.action_listeners.clear();
         self.nodes.begin_frame(self.window_title.as_ref());
+    }
+
+    /// Replay the nodes a reused prepaint built last frame: `range` indexes
+    /// [`RenderedA11y::log`]. Nodes whose parent lies outside the range become
+    /// children of the current top-of-stack node; the side maps are copied and
+    /// the action listeners moved for every node replayed. `contains_focus`
+    /// (the reused dispatch subtree's) carries the focused node over.
+    ///
+    /// The log is in pop order (children first), so it is walked in reverse
+    /// and a node is replayed only when its parent was: a duplicate id (an
+    /// element that moved between a cached and an uncached parent this frame)
+    /// is left out with its subtree, as a refused push is, never grafted as an
+    /// orphan. Bounds need no re-mapping: the cache key demands equal bounds.
+    pub(crate) fn reuse_range(&mut self, range: Range<usize>, contains_focus: bool) {
+        let Some(entries) = self.rendered.log.get(range) else {
+            return;
+        };
+        let in_range: FxHashSet<NodeId> = entries.iter().map(|(_, id, _)| *id).collect();
+        let mut pushed = FxHashSet::default();
+        // Decided parents first (reverse), appended in pop order (children
+        // first) so the next frame's range reads the same way.
+        let mut kept = Vec::with_capacity(entries.len());
+        for (parent, id, node) in entries.iter().rev() {
+            let parent_in_range = in_range.contains(parent);
+            if parent_in_range && !pushed.contains(parent) {
+                continue;
+            }
+            if !self.nodes.seen_ids.insert(*id) {
+                continue;
+            }
+            let parent = if parent_in_range {
+                *parent
+            } else {
+                match (
+                    self.nodes.ids_stack.last(),
+                    self.nodes.nodes_stack.last_mut(),
+                ) {
+                    (Some(head), Some(head_node)) => {
+                        head_node.push_child(*id);
+                        *head
+                    }
+                    _ => continue,
+                }
+            };
+            pushed.insert(*id);
+            kept.push((parent, *id, node.clone()));
+            if let Some(focus_id) = self.rendered.focus_ids.get(id) {
+                self.focus_ids.insert(*id, *focus_id);
+            }
+            if let Some(bounds) = self.rendered.node_bounds.get(id) {
+                self.node_bounds.insert(*id, *bounds);
+            }
+            if let Some(element) = self.rendered.element_ids.get(id) {
+                self.element_ids.insert(*id, element.clone());
+            }
+            if let Some(listeners) = self.rendered.action_listeners.remove(id) {
+                self.action_listeners
+                    .entry(*id)
+                    .or_default()
+                    .extend(listeners);
+            }
+        }
+        for (parent, id, node) in kept.into_iter().rev() {
+            self.nodes.all_nodes.push((id, node.clone()));
+            self.nodes.log.push((parent, id, node));
+        }
+        if !contains_focus {
+            return;
+        }
+        if let Some(focus) = self.rendered.focus.filter(|f| pushed.contains(f)) {
+            self.nodes.focus = Some(focus);
+        }
+        if let Some(claim) = self
+            .rendered
+            .active_descendant
+            .filter(|c| pushed.contains(c))
+        {
+            self.nodes.active_descendant = Some(claim);
+        }
     }
 
     /// Finalize the tree and produce a [`TreeUpdate`] for the platform adapter.
@@ -421,6 +530,11 @@ pub(crate) struct A11yNodeBuilder {
     /// This is the exact type required by accesskit, so we can't just make it a
     /// `HashMap<NodeId, Node>` to remove the need for `seen_ids`
     all_nodes: Vec<(NodeId, accesskit::Node)>,
+    /// `(parent, id, node)` for every `all_nodes` push this frame, in the
+    /// same order, so a reused prepaint range can replay its nodes (see
+    /// [`A11y::reuse_range`]); [`crate::Window::prepaint_index`] records its
+    /// length. `finalize` leaves it alone.
+    log: Vec<(NodeId, NodeId, accesskit::Node)>,
     seen_ids: FxHashSet<NodeId>,
     /// The node that GPUI considers focused. Note that this may be different to
     /// what is reported to accesskit - see [`Self::active_descendant`]
@@ -440,6 +554,7 @@ impl A11yNodeBuilder {
             ids_stack: SmallVec::new(),
             nodes_stack: SmallVec::new(),
             all_nodes: Vec::new(),
+            log: Vec::new(),
             seen_ids: FxHashSet::default(),
             focus: None,
             active_descendant: None,
@@ -499,8 +614,20 @@ impl A11yNodeBuilder {
         if let Some(parent) = self.nodes_stack.last_mut() {
             parent.push_child(id);
         }
+        self.log_node(id, &node);
         self.all_nodes.push((id, node));
         true
+    }
+
+    /// Records `node` in [`Self::log`] under the current top-of-stack parent.
+    fn log_node(&mut self, id: NodeId, node: &accesskit::Node) {
+        if let Some(parent) = self.ids_stack.last() {
+            self.log.push((*parent, id, node.clone()));
+        }
+    }
+
+    pub(crate) fn log_len(&self) -> usize {
+        self.log.len()
     }
 
     pub(crate) fn current_node_mut(&mut self) -> Option<&mut accesskit::Node> {
@@ -513,6 +640,7 @@ impl A11yNodeBuilder {
         debug_assert!(self.ids_stack.len() > 1, "pop would remove the root node");
 
         if let (Some(id), Some(node)) = (self.ids_stack.pop(), self.nodes_stack.pop()) {
+            self.log_node(id, &node);
             self.all_nodes.push((id, node));
         }
     }
@@ -520,6 +648,7 @@ impl A11yNodeBuilder {
     /// Push the root node to start a new frame.
     fn begin_frame(&mut self, window_title: Option<&SharedString>) {
         self.all_nodes.clear();
+        self.log.clear();
         self.ids_stack.clear();
         self.nodes_stack.clear();
         self.seen_ids.clear();
