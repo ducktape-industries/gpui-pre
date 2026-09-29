@@ -1349,7 +1349,7 @@ pub trait StatefulInteractiveElement: InteractiveElement {
 
     /// Report this element as the focused node in the accessibility tree,
     /// overriding the element that holds real keyboard focus — but only while
-    /// one of its ancestors actually holds focus.
+    /// its nearest focusable ancestor actually holds focus.
     ///
     /// This implements the `aria-activedescendant` pattern for composite
     /// widgets that keep keyboard focus on a container (e.g. a menu or
@@ -1359,9 +1359,10 @@ pub trait StatefulInteractiveElement: InteractiveElement {
     /// The element must also have a [`role`][Self::role] (and an id) so it
     /// produces an accessibility node. Unlike the web's container-side
     /// `aria-activedescendant`, this is set on the descendant; GPUI honors it
-    /// only when a focused ancestor is present in the tree, so it is safe to
-    /// set unconditionally on the selected child — if the container isn't
-    /// focused, the claim is ignored.
+    /// only when its nearest focusable ancestor (the container) is the focused
+    /// node, so it is safe to set unconditionally on the selected child — if
+    /// the container isn't focused, even while an outer node is, the claim is
+    /// ignored.
     fn aria_active_descendant(mut self) -> Self {
         self.interactivity().report_active_descendant_focus = true;
         self

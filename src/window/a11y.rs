@@ -279,7 +279,11 @@ impl A11y {
             }
             return;
         }
-        if self.nodes.has_node(node_id) && self.nodes.focus_is_ancestor_of_current() {
+        if self.nodes.has_node(node_id)
+            && self
+                .nodes
+                .nearest_focusable_ancestor_is_focused(&self.focus_ids)
+        {
             self.nodes.set_active_descendant(node_id);
         }
     }
@@ -421,10 +425,10 @@ pub(crate) struct A11yNodeBuilder {
     /// The node that GPUI considers focused. Note that this may be different to
     /// what is reported to accesskit - see [`Self::active_descendant`]
     focus: Option<NodeId>,
-    /// If a node calls `.aria_active_descendant()`, AND an ancestor is focused,
-    /// override it as the focused node. This supports the "active descendant"
-    /// pattern, which allows a focused container to act as if a descendant is
-    /// focused.
+    /// If a node calls `.aria_active_descendant()`, AND its nearest focusable
+    /// ancestor is focused, override it as the focused node. This supports the
+    /// "active descendant" pattern, which allows a focused container to act as
+    /// if a descendant is focused.
     active_descendant: Option<NodeId>,
     #[cfg(debug_assertions)]
     node_info: FxHashMap<NodeId, debug::NodeDebugInfo>,
@@ -542,15 +546,23 @@ impl A11yNodeBuilder {
         self.focus == Some(id)
     }
 
-    pub(crate) fn focus_is_ancestor_of_current(&self) -> bool {
-        let Some(focus) = self.focus else {
-            return false;
-        };
-
+    /// Whether the current node's nearest focusable ancestor (the first node
+    /// below it on the stack that is in `focus_ids`) is the focused node.
+    ///
+    /// A focusable element with no role pushes no node, so the walk passes
+    /// over it; it can never be the focused node either.
+    pub(crate) fn nearest_focusable_ancestor_is_focused(
+        &self,
+        focus_ids: &FxHashMap<NodeId, FocusId>,
+    ) -> bool {
         // The current node is on top of the stack; everything below it is an
         // ancestor.
         let ancestor_count = self.ids_stack.len().saturating_sub(1);
-        self.ids_stack[..ancestor_count].contains(&focus)
+        self.ids_stack[..ancestor_count]
+            .iter()
+            .rev()
+            .find(|id| focus_ids.contains_key(id))
+            .is_some_and(|id| self.focus == Some(*id))
     }
 
     pub(crate) fn set_active_descendant(&mut self, id: NodeId) {
@@ -750,94 +762,176 @@ mod tests {
         }
     }
 
+    // Registers `id` as focusable this frame, as a div with a focus handle does
+    // in its prepaint before its children.
+    fn push_focusable(a11y: &mut A11y, id: NodeId) {
+        assert!(a11y.nodes.push(id, test_node()));
+        a11y.set_focusable(id, FocusId::default());
+    }
+
     #[test]
     fn active_descendant_honored_when_container_focused() {
-        let mut builder = new_builder();
+        let mut a11y = new_a11y();
         let container = NodeId(1);
         let item = NodeId(2);
 
-        assert!(builder.push(container, test_node()));
-        builder.set_focus(container);
-        assert!(builder.push(item, test_node()));
+        push_focusable(&mut a11y, container);
+        a11y.set_focus(container);
+        assert!(a11y.nodes.push(item, test_node()));
 
-        // The item is on top of the stack; the focused container is its
-        // ancestor, so the claim is honored.
-        assert!(builder.focus_is_ancestor_of_current());
-        builder.set_active_descendant(item);
+        // The item's nearest focusable ancestor is the focused container, so
+        // the claim is honored.
+        a11y.set_active_descendant(item);
 
-        builder.pop(); // item
-        builder.pop(); // container
-        let update = builder.finalize();
+        a11y.nodes.pop(); // item
+        a11y.nodes.pop(); // container
+        let update = a11y.end_frame(Default::default());
         assert_eq!(update.focus, item);
     }
 
     #[test]
     fn active_descendant_honored_for_deep_descendant() {
-        let mut builder = new_builder();
+        let mut a11y = new_a11y();
         let container = NodeId(1);
         let group = NodeId(2);
         let item = NodeId(3);
 
-        assert!(builder.push(container, test_node()));
-        builder.set_focus(container);
-        assert!(builder.push(group, test_node()));
-        assert!(builder.push(item, test_node()));
+        push_focusable(&mut a11y, container);
+        a11y.set_focus(container);
+        assert!(a11y.nodes.push(group, test_node()));
+        assert!(a11y.nodes.push(item, test_node()));
 
         // The item is a grandchild of the focused container; depth doesn't
-        // matter, the focused ancestor is still on the stack.
-        assert!(builder.focus_is_ancestor_of_current());
-        builder.set_active_descendant(item);
+        // matter while no focusable node sits in between.
+        a11y.set_active_descendant(item);
 
-        builder.pop(); // item
-        builder.pop(); // group
-        builder.pop(); // container
-        let update = builder.finalize();
+        a11y.nodes.pop(); // item
+        a11y.nodes.pop(); // group
+        a11y.nodes.pop(); // container
+        let update = a11y.end_frame(Default::default());
         assert_eq!(update.focus, item);
+    }
+
+    // A focused outer node holds a focusable inner node that is not focused;
+    // the inner node's item claims. The inner node is the item's nearest
+    // focusable ancestor and does not have the keys, so the claim is ignored
+    // and the outer node stays focused.
+    #[test]
+    fn active_descendant_ignored_under_unfocused_focusable_ancestor() {
+        let mut a11y = new_a11y();
+        let outer = NodeId(1);
+        let inner = NodeId(2);
+        let item = NodeId(3);
+
+        push_focusable(&mut a11y, outer);
+        a11y.set_focus(outer);
+        push_focusable(&mut a11y, inner);
+        assert!(a11y.nodes.push(item, test_node()));
+        a11y.set_active_descendant(item);
+        a11y.nodes.pop(); // item
+        a11y.nodes.pop(); // inner
+        a11y.nodes.pop(); // outer
+
+        let update = a11y.end_frame(Default::default());
+        assert_eq!(update.focus, outer);
+    }
+
+    // Two composites each claim their active item: the focused one's item and,
+    // inside it, an unfocused focusable one's. Only the focused composite's
+    // claim counts, so there is one claim and no double-claim panic.
+    #[test]
+    fn focused_composite_claim_wins_over_unfocused_one() {
+        let mut a11y = new_a11y();
+        let focused = NodeId(1);
+        let focused_item = NodeId(2);
+        let unfocused = NodeId(3);
+        let unfocused_item = NodeId(4);
+
+        push_focusable(&mut a11y, focused);
+        a11y.set_focus(focused);
+
+        assert!(a11y.nodes.push(focused_item, test_node()));
+        a11y.set_active_descendant(focused_item);
+        a11y.nodes.pop(); // focused_item
+
+        push_focusable(&mut a11y, unfocused);
+        assert!(a11y.nodes.push(unfocused_item, test_node()));
+        a11y.set_active_descendant(unfocused_item);
+        a11y.nodes.pop(); // unfocused_item
+        a11y.nodes.pop(); // unfocused
+
+        a11y.nodes.pop(); // focused
+        let update = a11y.end_frame(Default::default());
+        assert_eq!(update.focus, focused_item);
+    }
+
+    // A focused box (a held pane) holds two unfocused composites that each
+    // claim their active item. Neither claim counts: the box is reported
+    // focused, with no double-claim panic.
+    #[test]
+    fn focused_box_over_two_unfocused_composites_stays_focused() {
+        let mut a11y = new_a11y();
+        let pane = NodeId(1);
+        let composites = [(NodeId(2), NodeId(3)), (NodeId(4), NodeId(5))];
+
+        push_focusable(&mut a11y, pane);
+        a11y.set_focus(pane);
+        for (composite, item) in composites {
+            push_focusable(&mut a11y, composite);
+            assert!(a11y.nodes.push(item, test_node()));
+            a11y.set_active_descendant(item);
+            a11y.nodes.pop(); // item
+            a11y.nodes.pop(); // composite
+        }
+        a11y.nodes.pop(); // pane
+
+        let update = a11y.end_frame(Default::default());
+        assert_eq!(update.focus, pane);
     }
 
     #[test]
     fn active_descendant_ignored_when_focus_in_other_subtree() {
-        let mut builder = new_builder();
+        let mut a11y = new_a11y();
         let focused_container = NodeId(1);
         let focused_leaf = NodeId(2);
         let other_container = NodeId(3);
         let other_item = NodeId(4);
 
         // First subtree holds real focus.
-        assert!(builder.push(focused_container, test_node()));
-        assert!(builder.push(focused_leaf, test_node()));
-        builder.set_focus(focused_leaf);
-        builder.pop(); // focused_leaf
-        builder.pop(); // focused_container
+        assert!(a11y.nodes.push(focused_container, test_node()));
+        push_focusable(&mut a11y, focused_leaf);
+        a11y.set_focus(focused_leaf);
+        a11y.nodes.pop(); // focused_leaf
+        a11y.nodes.pop(); // focused_container
 
-        // Second subtree: its item would claim the active descendant, but the
+        // Second subtree: its item claims the active descendant, but the
         // focus is not on any of its ancestors, so the gate rejects it.
-        assert!(builder.push(other_container, test_node()));
-        assert!(builder.push(other_item, test_node()));
-        assert!(!builder.focus_is_ancestor_of_current());
-        builder.pop(); // other_item
-        builder.pop(); // other_container
+        push_focusable(&mut a11y, other_container);
+        assert!(a11y.nodes.push(other_item, test_node()));
+        a11y.set_active_descendant(other_item);
+        a11y.nodes.pop(); // other_item
+        a11y.nodes.pop(); // other_container
 
-        let update = builder.finalize();
+        let update = a11y.end_frame(Default::default());
         assert_eq!(update.focus, focused_leaf);
     }
 
     #[test]
     fn active_descendant_ignored_when_nothing_focused() {
-        let mut builder = new_builder();
+        let mut a11y = new_a11y();
         let container = NodeId(1);
         let item = NodeId(2);
 
-        assert!(builder.push(container, test_node()));
-        assert!(builder.push(item, test_node()));
+        push_focusable(&mut a11y, container);
+        assert!(a11y.nodes.push(item, test_node()));
 
         // Nothing is focused (focus defaults to the root window node), so the
         // gate rejects the claim.
-        assert!(!builder.focus_is_ancestor_of_current());
-        builder.pop();
-        builder.pop();
+        a11y.set_active_descendant(item);
+        a11y.nodes.pop();
+        a11y.nodes.pop();
 
-        let update = builder.finalize();
+        let update = a11y.end_frame(Default::default());
         assert_eq!(update.focus, ROOT_NODE_ID);
     }
 
@@ -855,24 +949,32 @@ mod tests {
     }
 
     #[test]
-    fn focus_is_ancestor_excludes_self_and_non_ancestors() {
-        let mut builder = new_builder();
+    fn nearest_focusable_ancestor_excludes_self() {
+        let mut a11y = new_a11y();
         let container = NodeId(1);
-        let item = NodeId(2);
+        let inner = NodeId(2);
 
-        assert!(builder.push(container, test_node()));
-        builder.set_focus(container);
+        push_focusable(&mut a11y, container);
+        a11y.set_focus(container);
 
         // With the focused container itself on top, it is not its own (strict)
         // ancestor, so the gate is false.
-        assert!(!builder.focus_is_ancestor_of_current());
+        assert!(
+            !a11y
+                .nodes
+                .nearest_focusable_ancestor_is_focused(&a11y.focus_ids)
+        );
 
-        assert!(builder.push(item, test_node()));
-        // Now the focused container is a strict ancestor of the item on top.
-        assert!(builder.focus_is_ancestor_of_current());
+        // A focusable inner node on top: its own registration does not count,
+        // the focused container is its nearest focusable ancestor.
+        push_focusable(&mut a11y, inner);
+        assert!(
+            a11y.nodes
+                .nearest_focusable_ancestor_is_focused(&a11y.focus_ids)
+        );
 
-        builder.pop();
-        builder.pop();
+        a11y.nodes.pop();
+        a11y.nodes.pop();
     }
 
     // The double-claim guard panics only in debug builds; in release it falls
