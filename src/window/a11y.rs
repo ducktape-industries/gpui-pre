@@ -361,8 +361,9 @@ impl A11y {
     /// The log is in pop order (children first), so it is walked in reverse
     /// and a node is replayed only when its parent was: a duplicate id (an
     /// element that moved between a cached and an uncached parent this frame)
-    /// is left out with its subtree, as a refused push is, never grafted as an
-    /// orphan. Bounds need no re-mapping: the cache key demands equal bounds.
+    /// is left out with its subtree and recorded as refused, as a refused push
+    /// is, never grafted as an orphan, and its replayed parent no longer lists
+    /// it. Bounds need no re-mapping: the cache key demands equal bounds.
     pub(crate) fn reuse_range(&mut self, range: Range<usize>, contains_focus: bool) {
         let Some(entries) = self.rendered.log.get(range) else {
             return;
@@ -378,24 +379,18 @@ impl A11y {
                 continue;
             }
             if !self.nodes.seen_ids.insert(*id) {
+                if let Some(element) = self.rendered.element_ids.get(id) {
+                    self.refused.push((*id, element.clone()));
+                }
                 continue;
             }
-            let parent = if parent_in_range {
-                *parent
-            } else {
-                match (
-                    self.nodes.ids_stack.last(),
-                    self.nodes.nodes_stack.last_mut(),
-                ) {
-                    (Some(head), Some(head_node)) => {
-                        head_node.push_child(*id);
-                        *head
-                    }
-                    _ => continue,
-                }
+            let parent = match (parent_in_range, self.nodes.ids_stack.last()) {
+                (true, _) => *parent,
+                (false, Some(head)) => *head,
+                (false, None) => continue,
             };
             pushed.insert(*id);
-            kept.push((parent, *id, node.clone()));
+            kept.push((parent, *id, node.clone(), !parent_in_range));
             if let Some(focus_id) = self.rendered.focus_ids.get(id) {
                 self.focus_ids.insert(*id, *focus_id);
             }
@@ -412,7 +407,21 @@ impl A11y {
                     .extend(listeners);
             }
         }
-        for (parent, id, node) in kept.into_iter().rev() {
+        for (parent, id, mut node, top) in kept.into_iter().rev() {
+            // Pop order, so top-level siblings join the head as they were.
+            if top && let Some(head) = self.nodes.nodes_stack.last_mut() {
+                head.push_child(id);
+            }
+            // A child left out above must not stay listed under its parent.
+            if node.children().iter().any(|c| !pushed.contains(c)) {
+                let children: Vec<NodeId> = node
+                    .children()
+                    .iter()
+                    .copied()
+                    .filter(|c| pushed.contains(c))
+                    .collect();
+                node.set_children(children);
+            }
             self.nodes.all_nodes.push((id, node.clone()));
             self.nodes.log.push((parent, id, node));
         }
@@ -905,8 +914,9 @@ mod tests {
         let mut a11y = new_a11y();
         let container = NodeId(1);
         let item = NodeId(2);
+        let element = element("container");
 
-        assert!(a11y.nodes.push(container, test_node()));
+        assert!(a11y.push_element(container, test_node(), &element));
         assert!(a11y.nodes.push(item, test_node()));
         a11y.nodes.pop(); // item
         a11y.nodes.pop(); // container
@@ -915,10 +925,53 @@ mod tests {
         a11y.begin_frame();
         assert!(a11y.nodes.seen_ids.insert(container));
         a11y.reuse_range(0..2, false);
+        assert_eq!(a11y.refused_elements(), [(container, element)]);
 
         let update = a11y.end_frame(Default::default());
         let ids: Vec<NodeId> = update.nodes.iter().map(|(id, _)| *id).collect();
         assert_eq!(ids, [ROOT_NODE_ID]);
+    }
+
+    // Top-level siblings of a replayed range keep their order under the head.
+    #[test]
+    fn a_reused_range_keeps_sibling_order() {
+        let mut a11y = new_a11y();
+        assert!(a11y.nodes.push_leaf(NodeId(1), test_node()));
+        assert!(a11y.nodes.push_leaf(NodeId(2), test_node()));
+        a11y.end_frame(Default::default());
+
+        a11y.begin_frame();
+        a11y.reuse_range(0..2, false);
+        let update = a11y.end_frame(Default::default());
+        let root = update.nodes.iter().find(|(id, _)| *id == ROOT_NODE_ID);
+        assert_eq!(
+            root.map(|(_, n)| n.children()),
+            Some(&[NodeId(1), NodeId(2)][..])
+        );
+    }
+
+    // A replayed child whose id this frame already pushed elsewhere is not
+    // left listed under its replayed parent (accesskit panics on a child
+    // listed twice).
+    #[test]
+    fn a_reused_child_taken_live_is_listed_once() {
+        let mut a11y = new_a11y();
+        let (container, item) = (NodeId(1), NodeId(2));
+        assert!(a11y.nodes.push(container, test_node()));
+        assert!(a11y.nodes.push_leaf(item, test_node()));
+        a11y.nodes.pop(); // container
+        a11y.end_frame(Default::default());
+
+        a11y.begin_frame();
+        assert!(a11y.nodes.push_leaf(item, test_node()));
+        a11y.reuse_range(0..2, false);
+        let update = a11y.end_frame(Default::default());
+        let parents = update
+            .nodes
+            .iter()
+            .filter(|(_, n)| n.children().contains(&item))
+            .count();
+        assert_eq!(parents, 1);
     }
 
     #[test]
