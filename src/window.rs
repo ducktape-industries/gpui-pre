@@ -1008,6 +1008,9 @@ pub(crate) struct PrepaintStateIndex {
     dispatch_tree_index: usize,
     accessed_element_states_index: usize,
     line_layout_index: LineLayoutIndex,
+    /// Into the a11y node log (see `A11yNodeBuilder::log`); stale and unused
+    /// while accessibility is inactive (reuse checks `rendered.built`).
+    a11y_index: usize,
 }
 
 #[derive(Clone, Default)]
@@ -3611,6 +3614,7 @@ impl Window {
             };
             // clear the builder state regardless
             let tree_update = self.a11y.end_frame(frame_info);
+            self.a11y.rendered.built = true;
 
             if should_send_a11y_update {
                 log::debug!(
@@ -3619,6 +3623,8 @@ impl Window {
                 );
                 self.platform_window.a11y_tree_update(tree_update);
             }
+        } else {
+            self.a11y.rendered.built = false;
         }
     }
 
@@ -3815,6 +3821,7 @@ impl Window {
             dispatch_tree_index: self.next_frame.dispatch_tree.len(),
             accessed_element_states_index: self.next_frame.accessed_element_states.len(),
             line_layout_index: self.text_system.layout_index(),
+            a11y_index: self.a11y.nodes.log_len(),
         }
     }
 
@@ -3847,6 +3854,17 @@ impl Window {
 
         if reused_subtree.contains_focus() {
             self.next_frame.focus = self.focus;
+        }
+
+        // The rendered frame built its tree with accessibility on, so the
+        // range's nodes are in its log; a frame drawn without it leaves the
+        // cached view's nodes out, as before, until the refresh that follows
+        // activation renders it again.
+        if self.a11y.is_active() && self.a11y.rendered.built {
+            self.a11y.reuse_range(
+                range.start.a11y_index..range.end.a11y_index,
+                reused_subtree.contains_focus(),
+            );
         }
 
         self.next_frame.deferred_draws.extend(
@@ -6835,7 +6853,10 @@ impl Window {
     /// active refused, each with the node id it shared with an earlier node,
     /// in paint order. Such a node is left out of the tree.
     ///
-    /// Always empty in a debug build, which panics on the duplicate first.
+    /// In a debug build a duplicate pushed live panics first, so only
+    /// duplicates skipped while replaying a cached view are listed there.
+    /// The list is not replayed: a refusal inside a cached view is listed only
+    /// on frames that render the view live, though its node stays left out.
     pub fn a11y_refused_elements(&self) -> &[(accesskit::NodeId, GlobalElementId)] {
         self.a11y.refused_elements()
     }

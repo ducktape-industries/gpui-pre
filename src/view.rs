@@ -158,6 +158,9 @@ impl std::fmt::Debug for AnyWeakView {
     }
 }
 
+#[cfg(test)]
+mod probes;
+
 mod any_view {
     use crate::{AnyElement, AnyView, App, IntoElement, Render, Window};
 
