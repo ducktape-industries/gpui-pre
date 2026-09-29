@@ -6853,7 +6853,10 @@ impl Window {
     /// active refused, each with the node id it shared with an earlier node,
     /// in paint order. Such a node is left out of the tree.
     ///
-    /// Always empty in a debug build, which panics on the duplicate first.
+    /// In a debug build a duplicate pushed live panics first, so only
+    /// duplicates skipped while replaying a cached view are listed there.
+    /// The list is not replayed: a refusal inside a cached view is listed only
+    /// on frames that render the view live, though its node stays left out.
     pub fn a11y_refused_elements(&self) -> &[(accesskit::NodeId, GlobalElementId)] {
         self.a11y.refused_elements()
     }

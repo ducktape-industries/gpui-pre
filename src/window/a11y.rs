@@ -425,16 +425,18 @@ impl A11y {
             self.nodes.all_nodes.push((id, node.clone()));
             self.nodes.log.push((parent, id, node));
         }
-        if !contains_focus {
-            return;
-        }
-        if let Some(focus) = self.rendered.focus.filter(|f| pushed.contains(f)) {
+        if contains_focus && let Some(focus) = self.rendered.focus.filter(|f| pushed.contains(f)) {
             self.nodes.focus = Some(focus);
         }
-        if let Some(claim) = self
-            .rendered
-            .active_descendant
-            .filter(|c| pushed.contains(c))
+        // A claim valid last frame whose focused node is set again this frame
+        // (in the range, or an ancestor already pushed live) is what a live
+        // build would accept.
+        if self.nodes.focus.is_some()
+            && self.nodes.focus == self.rendered.focus
+            && let Some(claim) = self
+                .rendered
+                .active_descendant
+                .filter(|c| pushed.contains(c))
         {
             self.nodes.active_descendant = Some(claim);
         }
