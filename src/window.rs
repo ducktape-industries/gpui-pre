@@ -1008,8 +1008,8 @@ pub(crate) struct PrepaintStateIndex {
     dispatch_tree_index: usize,
     accessed_element_states_index: usize,
     line_layout_index: LineLayoutIndex,
-    /// Into the a11y node log (see `A11yNodeBuilder::log`); 0 while
-    /// accessibility is inactive.
+    /// Into the a11y node log (see `A11yNodeBuilder::log`); stale and unused
+    /// while accessibility is inactive (reuse checks `rendered.built`).
     a11y_index: usize,
 }
 
