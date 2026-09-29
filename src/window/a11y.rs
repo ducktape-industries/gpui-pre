@@ -822,7 +822,7 @@ mod tests {
     // Import specific items rather than glob-importing `super`, which would pull
     // in gpui's own `test` attribute macro and shadow the standard one.
     use super::{A11y, A11yNodeBuilder, ROOT_NODE_ID};
-    use crate::{ElementId, FocusId, GlobalElementId};
+    use crate::{Bounds, ElementId, FocusId, GlobalElementId, point, px, size};
     use accesskit::{NodeId, Role};
     use std::sync::{Arc, atomic::AtomicBool};
 
@@ -864,6 +864,61 @@ mod tests {
 
         a11y.begin_frame();
         assert!(a11y.refused_elements().is_empty());
+    }
+
+    // A frame's tree, then the next frame replaying it whole: the focused
+    // container's active-descendant claim and the item's bounds come back
+    // with the nodes, and the replayed nodes hang under the new root.
+    #[test]
+    fn a_reused_range_carries_the_claim_and_the_bounds() {
+        let mut a11y = new_a11y();
+        let container = NodeId(1);
+        let item = NodeId(2);
+        let bounds = Bounds::new(point(px(1.), px(2.)), size(px(3.), px(4.)));
+
+        push_focusable(&mut a11y, container);
+        a11y.set_focus(container);
+        assert!(a11y.nodes.push(item, test_node()));
+        a11y.node_bounds.insert(item, bounds);
+        a11y.set_active_descendant(item);
+        a11y.nodes.pop(); // item
+        a11y.nodes.pop(); // container
+        assert_eq!(a11y.end_frame(Default::default()).focus, item);
+
+        a11y.begin_frame();
+        assert_eq!(a11y.rendered.log.len(), 2);
+        a11y.reuse_range(0..2, true);
+
+        assert_eq!(a11y.nodes.focus, Some(container));
+        assert_eq!(a11y.nodes.active_descendant, Some(item));
+        assert_eq!(a11y.node_bounds.get(&item), Some(&bounds));
+        let update = a11y.end_frame(Default::default());
+        assert_eq!(update.focus, item);
+        let root = update.nodes.iter().find(|(id, _)| *id == ROOT_NODE_ID);
+        assert_eq!(root.map(|(_, n)| n.children()), Some(&[container][..]));
+    }
+
+    // A replayed node whose id this frame already pushed is left out, and so
+    // is its subtree: no node is grafted under a parent that is not there.
+    #[test]
+    fn a_reused_duplicate_is_left_out_with_its_subtree() {
+        let mut a11y = new_a11y();
+        let container = NodeId(1);
+        let item = NodeId(2);
+
+        assert!(a11y.nodes.push(container, test_node()));
+        assert!(a11y.nodes.push(item, test_node()));
+        a11y.nodes.pop(); // item
+        a11y.nodes.pop(); // container
+        a11y.end_frame(Default::default());
+
+        a11y.begin_frame();
+        assert!(a11y.nodes.seen_ids.insert(container));
+        a11y.reuse_range(0..2, false);
+
+        let update = a11y.end_frame(Default::default());
+        let ids: Vec<NodeId> = update.nodes.iter().map(|(id, _)| *id).collect();
+        assert_eq!(ids, [ROOT_NODE_ID]);
     }
 
     #[test]

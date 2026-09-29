@@ -343,6 +343,9 @@ struct Card {
     renders: Count,
     btn: FocusHandle,
     clicks: Count,
+    /// Mouse clicks on the card itself (no a11y listener: a Click action on
+    /// its node falls back to a synthesized click at its bounds' centre).
+    card_clicks: Count,
     deferred: bool,
 }
 
@@ -356,7 +359,12 @@ impl Render for Card {
             .track_focus(&self.btn)
             .size(px(10.))
             .on_a11y_action(Action::Click, move |_, _, _| clicks.set(clicks.get() + 1));
-        let card = div().id("card").role(Role::Group).size(px(40.));
+        let card_clicks = self.card_clicks.clone();
+        let card = div()
+            .id("card")
+            .role(Role::Group)
+            .size(px(40.))
+            .on_click(move |_, _, _| card_clicks.set(card_clicks.get() + 1));
         match self.deferred {
             true => card.child(deferred(anchored().child(btn))),
             false => card.child(btn),
@@ -428,14 +436,15 @@ fn request(action: Action, target_node: NodeId) -> ActionRequest {
 /// action) still answer, and a Focus into the card survives the next reuse.
 fn a11y_nodes_survive_cache_reuse(cx: &mut TestAppContext, deferred: bool) {
     let c: [Count; 3] = Default::default();
-    let clicks = Count::default();
-    let (k, kc) = (c.clone(), clicks.clone());
+    let (clicks, card_clicks) = (Count::default(), Count::default());
+    let (k, kc, kcc) = (c.clone(), clicks.clone(), card_clicks.clone());
     let (root, mut native) = open(cx, move |cx| Shell {
         renders: k[0].clone(),
         card: cx.new(|cx| Card {
             renders: k[1].clone(),
             btn: cx.focus_handle(),
             clicks: kc,
+            card_clicks: kcc,
             deferred,
         }),
         dot: cx.new(|_| Leaf::new(&k[2])),
@@ -517,6 +526,16 @@ fn a11y_nodes_survive_cache_reuse(cx: &mut TestAppContext, deferred: bool) {
         [14, 3, 14],
         "one miss for the focus frame, then a hit"
     );
+
+    // A Click on a node without a listener falls back to a synthesized mouse
+    // click at the node's replayed bounds, through the replayed hitboxes.
+    native.update(|window, cx| window.dispatch_a11y_action(request(Action::Click, card), cx));
+    assert_eq!(
+        card_clicks.get(),
+        1,
+        "the fallback click reached the card after a reused frame"
+    );
+    assert_eq!(clicks.get(), 1, "the card's centre is off the button");
 }
 
 #[gpui::test]
