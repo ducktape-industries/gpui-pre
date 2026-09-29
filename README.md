@@ -1,11 +1,13 @@
 # gpui-pre (ducktape-industries fork)
 
-**What:** [`gpui-pre` 0.3.5](https://crates.io/crates/gpui-pre/0.3.5) exactly as published on crates.io (first commit), plus four small commits:
+**What:** [`gpui-pre` 0.3.7](https://crates.io/crates/gpui-pre/0.3.7) exactly as published on crates.io (the base commit), plus our patches. The first four are accessibility:
 
 1. `test-support: the test window keeps the last accessibility tree update` — `TestWindow` retains the last AccessKit `TreeUpdate` it is sent; `TestWindow::last_a11y_tree_update` and `Window::last_a11y_tree_update` (test-support only) read it.
 2. `window: a public switch activates accessibility for one window` — `Window::activate_a11y()` builds that window's tree with no assistive technology attached.
 3. `div: an aria_disabled setter on the element accessibility API` — `aria_disabled(bool)` beside `aria_selected`/`aria_expanded`/`aria_toggled`.
 4. `window: read the accessibility tree, its element ids, and dispatch an action at runtime` — `Window::a11y_tree()` (the last `TreeUpdate`, in every build), `Window::a11y_element_id(node)` (the `GlobalElementId` that built a node), `Window::dispatch_a11y_action(request)` (the adapter's own action path). Read-only accessors plus one public entry to the existing handler; nothing changes unless called.
+
+The later ones each have a section below: link wrapping, `Window::set_bounds`, bounds observers on full-screen/maximize, one tab stop per focus handle, refused accessibility nodes, the JavaScript-free wasm guest gates, and the vendored siblings (`vendor/`) those need.
 
 **Why:** ducktape-app #114 gates merges on an accessibility contract (`ax_contract`) that reads every screen's AccessKit tree headless. Without (1) and (2) no headless test can see the tree: the test window dropped it and a window only built it once an adapter activated. (4) is for the app's opt-in loopback test door, which serves that same tree to a QA runner in a real (release) build and acts through the same path a screen reader does.
 
@@ -13,9 +15,10 @@
 
 ### Re-applying on a gpui-pre bump
 
-1. Start a branch from the new `gpui-pre` release exactly as published on crates.io (one commit: unpack the `.crate`, nothing else).
-2. `git cherry-pick` the four commits above in order (2bd3361, a28ce2b, 8705c2b, 021b436); conflicts are confined to `src/window.rs`, `src/platform/test/window.rs` and `src/elements/div.rs`.
-3. In ducktape-app, set the new full rev in `[patch.crates-io]`, then run `cargo test ax_contract` and the door tests: they fail if any of the four is missing.
+1. Start a branch from `main` whose first commit is the new `gpui-pre` release exactly as published on crates.io (one commit: the tree is the unpacked `.crate`, nothing else; `diff -rq` against the unpacked archive prints nothing).
+2. `git cherry-pick -x` every patch commit of the previous bump in `git log` order. A commit that carries a `vendor/` crate (the wasm-guest gates: scheduler and zlog; `set_bounds`: linux and macos; the wgpu emoji fix) is a refresh, not a plain pick: `cherry-pick -n`, replace the vendor directory with the new published archive, reapply our delta (diff of the old vendor against the old published archive), record the new archive SHA-256 in its `README.ducktape.md`, then commit with the original message plus a note. `diff -rq <published> vendor/<crate>` must list only `README.ducktape.md` and the patched files.
+3. Run this crate's own tests with the vendored siblings patched in and `test-support` on: `cargo test --lib --features test-support --config 'patch.crates-io.gpui-pre-scheduler.path="vendor/gpui-pre-scheduler"' --config 'patch.crates-io.gpui-pre-zlog.path="vendor/gpui-pre-zlog"'`, and the a11y/tab_stop tests again with `--release` (the refused-duplicate test only records in release). Two tests `include_bytes!` zed's `assets/fonts/{ibm-plex-sans,lilex}` three directories above `src/`; fetch them from zed at the snapshot rev. Then `cargo tree --target wasm32-unknown-unknown --no-default-features -e normal` must show no `wasm-bindgen`, `js-sys`, `web-sys`, `web-time` or `getrandom`. Root `Cargo.lock` is the published one and is not committed with resolver changes.
+4. In ducktape-app and modules, set the new full rev in every `[patch.crates-io]` entry (all fork crates at one rev), then run `cargo test ax_contract` and the door tests: they fail if any of the accessibility commits is missing.
 
 ### Link wrapping
 
@@ -57,13 +60,13 @@ No JavaScript import is replaced with a shim.
   `fastrand/js`, which imports getrandom's browser backend. Native targets
   and `web` retain flume defaults. Browser worker threads imply `web`.
 
-Consumers must patch `gpui-pre`, `gpui-pre-scheduler`, and `gpui-pre-zlog`
-from the same fork revision. The two sibling packages live in `vendor/`;
-`README.ducktape.md` records each original crates.io archive SHA-256. Cargo
+Consumers must patch `gpui-pre` and every package in `vendor/` from the same
+fork revision. Each vendored package's `README.ducktape.md` records its
+original crates.io archive SHA-256. Cargo
 ignores dependency manifests' patch tables, so patches belong in each
 consumer workspace's `[patch.crates-io]` table, not this dependency.
 
-On a gpui-pre bump, refresh these two sibling sources and archive hashes,
+On a gpui-pre bump, refresh the scheduler and zlog sources and archive hashes,
 reapply the dependency feature/target gates and scheduler Instant cfg,
 and preserve the existing accessibility changes. Inspect the full wasm
 normal dependency tree for wasm-bindgen, js-sys, and web-sys; transitive
@@ -192,10 +195,17 @@ Currently, the best way to learn about these APIs is to read the Zed source code
 `Window::set_bounds` moves and sizes a window's outer frame in the
 coordinates `Window::bounds` reports; `resize` keeps the origin. The backends
 that implement it are vendored: `vendor/gpui-pre-linux` (X11) and
-`vendor/gpui-pre-macos`, each 0.3.5 as published plus that one method (see
+`vendor/gpui-pre-macos`, each 0.3.7 as published plus that one method (see
 their `README.ducktape.md`). Wayland and Windows keep the trait default, which
 only resizes. Consumers patch `gpui-pre-linux` and `gpui-pre-macos` from the
 same revision as `gpui-pre`.
+
+### Linux color emoji
+
+`vendor/gpui-pre-wgpu` is 0.3.7 as published plus one condition in
+`load_family`: a known color emoji face is not removed for lacking a Latin
+`m`. See its `README.ducktape.md`. The app repo's `font_fallback` tests pin
+the behavior.
 
 ### Guest wire size
 
