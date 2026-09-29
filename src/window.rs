@@ -2307,11 +2307,11 @@ impl Window {
             return;
         }
 
-        self.focus = Some(handle.id);
+        let previous = self.focus.replace(handle.id);
         self.focus_generation = self.focus_generation.wrapping_add(1);
         self.clear_pending_keystrokes(cx);
 
-        self.refresh();
+        self.invalidate_focus_move(previous, Some(handle.id));
     }
 
     /// Remove focus from all elements within this context's window.
@@ -2325,8 +2325,30 @@ impl Window {
         if self.focus.is_some() {
             self.focus_generation = self.focus_generation.wrapping_add(1);
         }
-        self.focus = None;
-        self.refresh();
+        let previous = self.focus.take();
+        self.invalidate_focus_move(previous, None);
+    }
+
+    /// A focus move redraws the views that rendered the old and the new focus
+    /// ids (and their ancestors), not the whole window: `refresh` made every
+    /// cached view miss on the next draw. A view that reads a focus handle it
+    /// did not render must observe focus to see the move. Like `refresh`, this
+    /// is a no-op while a draw is in progress: `draw` schedules the frame for a
+    /// move made by its focus listeners.
+    fn invalidate_focus_move(&mut self, previous: Option<FocusId>, next: Option<FocusId>) {
+        if !self.invalidator.not_drawing() {
+            return;
+        }
+        for focus_id in [previous, next].into_iter().flatten() {
+            if let Some(view_id) = self
+                .rendered_frame
+                .dispatch_tree
+                .view_of_focusable(focus_id)
+            {
+                self.mark_view_dirty(view_id);
+            }
+        }
+        self.invalidator.set_dirty(true);
     }
 
     /// Blur the window and don't allow anything in it to be focused again.
@@ -3399,11 +3421,11 @@ impl Window {
         self.refreshing = false;
         self.invalidator.set_phase(DrawPhase::None);
         // Focus listeners may move focus (e.g. a dock forwarding focus to its active
-        // panel). `Window::focus` suppresses `refresh` while a draw is in progress, so
+        // panel). `Window::focus` suppresses its invalidation while a draw is in progress, so
         // schedule another frame here to render the new focus state and dispatch the
         // resulting focus events.
         if self.focus != focus_before_listeners {
-            self.refresh();
+            self.invalidate_focus_move(focus_before_listeners, self.focus);
         }
         self.needs_present.set(true);
 
