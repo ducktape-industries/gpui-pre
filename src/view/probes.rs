@@ -693,3 +693,58 @@ fn p8_a_focus_move_re_renders_the_two_views_that_own_it(cx: &mut TestAppContext)
     assert_eq!(after_c, [3, 1, 3, 2, 1]);
     assert!(native.update(|window, _| c_handle.is_focused(window)));
 }
+
+// P8b: `blur` and a focus move made by a focus listener during a draw take the
+// same two-view path. B's listener forwards focus to C; then the window blurs.
+#[gpui::test]
+fn p8b_blur_and_a_listener_move_re_render_two_views(cx: &mut TestAppContext) {
+    let c: [Count; 5] = Default::default();
+    let k = c.clone();
+    let (root, mut native) = open(cx, move |cx| {
+        let stop = |i: usize, cx: &mut App| {
+            let handle = cx.focus_handle();
+            cx.new(|_| Stop {
+                renders: k[i].clone(),
+                handle,
+                reads: None,
+            })
+        };
+        Stops {
+            renders: k[0].clone(),
+            stops: vec![stop(1, cx), stop(2, cx), stop(3, cx), stop(4, cx)],
+        }
+    });
+    native.update(|window, _| window.activate_window());
+    native.run_until_parked();
+    let base = counts(&c);
+    let stops = root.read_with(&native, |root, _| root.stops.clone());
+    let handle =
+        |i: usize, native: &VisualTestContext| stops[i].read_with(native, |s, _| s.handle.clone());
+    let (b_handle, c_handle) = (handle(1, &native), handle(2, &native));
+    let b = stops[1].clone();
+    let fwd = c_handle.clone();
+    let _sub = native.update(|window, cx| {
+        b.update(cx, |_, cx| {
+            cx.on_focus(&b_handle, window, move |_, window, cx| {
+                window.focus(&fwd, cx)
+            })
+        })
+    });
+    native.update(|window, cx| window.focus(&b_handle, cx));
+    native.run_until_parked();
+    // The test platform draws on a flush; the draw-end move left the window dirty.
+    native.update(|_, _| ());
+    let after_fwd = counts(&c);
+    assert!(native.update(|window, _| c_handle.is_focused(window)));
+    native.update(|window, cx| window.blur(cx));
+    native.run_until_parked();
+    let after_blur = counts(&c);
+    eprintln!("P8b {base:?} -> fwd {after_fwd:?} -> blur {after_blur:?}");
+    let d = |a: [u32; 5]| std::array::from_fn::<u32, 5, _>(|i| a[i] - base[i]);
+    assert_eq!(
+        d(after_fwd),
+        [2, 0, 2, 1, 0],
+        "listener move: B and C, not A or D"
+    );
+    assert_eq!(d(after_blur), [3, 0, 2, 2, 0], "blur: C only");
+}
