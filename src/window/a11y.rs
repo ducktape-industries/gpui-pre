@@ -148,12 +148,6 @@ pub(crate) struct A11y {
     pub(crate) nodes: A11yNodeBuilder,
     pub(crate) focus_ids: FxHashMap<NodeId, FocusId>,
     pub(crate) node_bounds: FxHashMap<NodeId, Bounds<Pixels>>,
-    /// The element each node of this frame was built from, so a tool can
-    /// name a node by its element path rather than its hashed [`NodeId`].
-    pub(crate) element_ids: FxHashMap<NodeId, GlobalElementId>,
-    /// The elements whose node this frame refused because an earlier node
-    /// already had the same id, in paint order.
-    refused: Vec<(NodeId, GlobalElementId)>,
     pub(crate) action_listeners: FxHashMap<NodeId, Vec<(Action, A11yActionListener)>>,
     /// The window's title, used to label the root node so assistive
     /// technology can tell windows apart.
@@ -182,8 +176,6 @@ impl A11y {
             nodes: A11yNodeBuilder::new(),
             focus_ids: FxHashMap::default(),
             node_bounds: FxHashMap::default(),
-            element_ids: FxHashMap::default(),
-            refused: Vec::new(),
             action_listeners: FxHashMap::default(),
             window_title,
             last_focus_without_node: None,
@@ -218,16 +210,15 @@ impl A11y {
     /// See the docs for [`Self::active_flag`] and [`Self::active_this_frame`]
     /// for more commentary.
     pub(crate) fn sync_active_flag(&mut self) {
-        self.active_this_frame = !self.force_disabled && self.active_flag.load(Ordering::SeqCst);
+        self.active_this_frame = self.is_enabled() && self.active_flag.load(Ordering::SeqCst);
+    }
+
+    pub(crate) fn is_enabled(&self) -> bool {
+        !self.force_disabled
     }
 
     pub(crate) fn is_active(&self) -> bool {
         self.active_this_frame
-    }
-
-    /// Marks accessibility as requested, as an adapter's activation does.
-    pub(crate) fn activate(&self) {
-        self.active_flag.store(true, Ordering::SeqCst);
     }
 
     pub(crate) fn set_focusable(&mut self, node_id: NodeId, focus_id: FocusId) {
@@ -280,36 +271,10 @@ impl A11y {
         }
     }
 
-    /// Push the node of `element` onto the tree, remembering the element for
-    /// [`Window::a11y_element_id`] or, when the id is taken, for
-    /// [`Window::a11y_refused_elements`].
-    ///
-    /// Returns `true` if the node was pushed.
-    pub(crate) fn push_element(
-        &mut self,
-        node_id: NodeId,
-        node: accesskit::Node,
-        element: &GlobalElementId,
-    ) -> bool {
-        let pushed = self.nodes.push(node_id, node);
-        if pushed {
-            self.element_ids.insert(node_id, element.clone());
-        } else {
-            self.refused.push((node_id, element.clone()));
-        }
-        pushed
-    }
-
-    pub(crate) fn refused_elements(&self) -> &[(NodeId, GlobalElementId)] {
-        &self.refused
-    }
-
     /// Clear per-frame state and push the root node to start a new frame.
     pub(crate) fn begin_frame(&mut self) {
         self.focus_ids.clear();
         self.node_bounds.clear();
-        self.element_ids.clear();
-        self.refused.clear();
         self.action_listeners.clear();
         self.nodes.begin_frame(self.window_title.as_ref());
     }
@@ -327,10 +292,6 @@ impl A11y {
         #[cfg(debug_assertions)]
         self.debug.capture_node_info(&self.nodes.node_info);
         update
-    }
-
-    pub(crate) fn last_tree_update(&self) -> Option<&TreeUpdate> {
-        self.debug.last_tree_update()
     }
 
     pub(crate) fn debug_tree_json(&self) -> Option<String> {
@@ -677,7 +638,7 @@ mod tests {
     // Import specific items rather than glob-importing `super`, which would pull
     // in gpui's own `test` attribute macro and shadow the standard one.
     use super::{A11y, A11yNodeBuilder, ROOT_NODE_ID};
-    use crate::{ElementId, FocusId, GlobalElementId};
+    use crate::FocusId;
     use accesskit::{NodeId, Role};
     use std::sync::{Arc, atomic::AtomicBool};
 
@@ -697,40 +658,17 @@ mod tests {
         a11y
     }
 
-    fn element(name: &'static str) -> GlobalElementId {
-        GlobalElementId(Arc::from([ElementId::Name(name.into())]))
-    }
-
-    // A second element with an id already used this frame: panic in debug; in
-    // release its node is left out and the element is recorded as refused.
     #[test]
-    #[cfg_attr(debug_assertions, should_panic(expected = "Duplicate a11y node id"))]
-    fn a_second_element_with_one_id_is_refused() {
-        let mut a11y = new_a11y();
-        let id = NodeId(1);
-        let (first, second) = (element("first"), element("second"));
+    fn accessibility_enabled_is_independent_of_activation() {
+        for force_disabled in [false, true] {
+            for active in [false, true] {
+                let mut a11y = A11y::new(Arc::new(AtomicBool::new(active)), force_disabled, None);
+                a11y.sync_active_flag();
 
-        assert!(a11y.push_element(id, test_node(), &first));
-        a11y.nodes.pop();
-        assert!(!a11y.push_element(id, test_node(), &second));
-
-        assert_eq!(a11y.refused_elements(), [(id, second)]);
-        assert_eq!(a11y.element_ids.get(&id), Some(&first));
-
-        a11y.begin_frame();
-        assert!(a11y.refused_elements().is_empty());
-    }
-
-    #[test]
-    fn distinct_ids_refuse_nothing() {
-        let mut a11y = new_a11y();
-
-        assert!(a11y.push_element(NodeId(1), test_node(), &element("first")));
-        a11y.nodes.pop();
-        assert!(a11y.push_element(NodeId(2), test_node(), &element("second")));
-        a11y.nodes.pop();
-
-        assert!(a11y.refused_elements().is_empty());
+                assert_eq!(a11y.is_enabled(), !force_disabled);
+                assert_eq!(a11y.is_active(), !force_disabled && active);
+            }
+        }
     }
 
     #[test]

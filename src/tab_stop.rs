@@ -75,21 +75,9 @@ impl Default for TabStopMap {
 }
 
 impl TabStopMap {
-    /// A handle holds one stop per frame, at its first insert. An element and
-    /// one inside it may track the same handle (a labelled field around its
-    /// input); a second entry would be a stop beside the first that `next` or
-    /// `prev` lands on, the handle already focused. The first insert is the
-    /// outermost element's, since a div inserts its own handle before its
-    /// children paint: the place, tab index and group the app gave the
-    /// control. The operation is still recorded, so a cached element's
-    /// replayed range holds the stop when nothing outside it tracks the
-    /// handle any more.
     pub fn insert(&mut self, focus_handle: &FocusHandle) {
         self.insertion_history
             .push(TabStopOperation::Insert(focus_handle.clone()));
-        if self.by_id.contains_key(&focus_handle.id) {
-            return;
-        }
         let mut path = self.current_path.clone();
         path.0.push(focus_handle.tab_index);
         let order = TabStopNode {
@@ -418,59 +406,6 @@ mod tests {
             tab_index_map.prev(Some(&expected[4].id)),
             Some(expected[3].clone())
         );
-    }
-
-    /// A labelled field: the element around an input tracks the input's own
-    /// handle, so one frame inserts that handle twice. It is one stop: Tab
-    /// and Shift+Tab both leave it, also when the inner insert comes from a
-    /// cached element replayed into the next frame.
-    #[test]
-    fn test_one_tab_stop_per_focus_handle() {
-        let focus_map = Arc::new(FocusMap::default());
-        let before = FocusHandle::new(&focus_map).tab_stop(true);
-        let field = FocusHandle::new(&focus_map).tab_stop(true);
-        let after = FocusHandle::new(&focus_map).tab_stop(true);
-
-        #[track_caller]
-        fn assert_between(
-            map: &TabStopMap,
-            before: &FocusHandle,
-            field: &FocusHandle,
-            after: &FocusHandle,
-        ) {
-            assert_eq!(map.next(Some(&before.id)).as_ref(), Some(field));
-            assert_eq!(map.next(Some(&field.id)).as_ref(), Some(after));
-            assert_eq!(map.prev(Some(&field.id)).as_ref(), Some(before));
-            assert_eq!(map.prev(Some(&after.id)).as_ref(), Some(field));
-            assert_eq!(map.tab_stop_count(), 3);
-        }
-
-        // The outer element, then the input inside it (a cached element).
-        let mut rendered = TabStopMap::default();
-        rendered.insert(&before);
-        rendered.insert(&field);
-        let start = rendered.paint_index();
-        rendered.insert(&field);
-        let end = rendered.paint_index();
-        rendered.insert(&after);
-        assert_between(&rendered, &before, &field, &after);
-        let cached = &rendered.insertion_history[start..end];
-
-        // The next frame paints the outer element and replays the input.
-        let mut next = TabStopMap::default();
-        next.insert(&before);
-        next.insert(&field);
-        next.replay(cached);
-        next.insert(&after);
-        assert_between(&next, &before, &field, &after);
-
-        // The outer element no longer tracks the handle: the replayed input
-        // still holds its stop.
-        let mut next = TabStopMap::default();
-        next.insert(&before);
-        next.replay(cached);
-        next.insert(&after);
-        assert_between(&next, &before, &field, &after);
     }
 
     #[test]
