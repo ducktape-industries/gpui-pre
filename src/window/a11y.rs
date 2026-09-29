@@ -713,15 +713,6 @@ impl A11yNodeBuilder {
             .copied()
     }
 
-    #[cfg(test)]
-    pub(crate) fn nearest_focusable_ancestor_is_focused(
-        &self,
-        focus_ids: &FxHashMap<NodeId, FocusId>,
-    ) -> bool {
-        self.nearest_focusable_ancestor(focus_ids)
-            .is_some_and(|id| self.focus == Some(id))
-    }
-
     pub(crate) fn set_active_descendant(&mut self, id: NodeId) {
         if self
             .active_descendant
@@ -1246,22 +1237,17 @@ mod tests {
         let inner = NodeId(2);
 
         push_focusable(&mut a11y, container);
-        a11y.set_focus(container);
 
-        // With the focused container itself on top, it is not its own (strict)
-        // ancestor, so the gate is false.
-        assert!(
-            !a11y
-                .nodes
-                .nearest_focusable_ancestor_is_focused(&a11y.focus_ids)
-        );
+        // With the container itself on top, it is not its own (strict)
+        // ancestor, so it has no gate.
+        assert_eq!(a11y.nodes.nearest_focusable_ancestor(&a11y.focus_ids), None);
 
         // A focusable inner node on top: its own registration does not count,
-        // the focused container is its nearest focusable ancestor.
+        // the container is its nearest focusable ancestor.
         push_focusable(&mut a11y, inner);
-        assert!(
-            a11y.nodes
-                .nearest_focusable_ancestor_is_focused(&a11y.focus_ids)
+        assert_eq!(
+            a11y.nodes.nearest_focusable_ancestor(&a11y.focus_ids),
+            Some(container)
         );
 
         a11y.nodes.pop();
