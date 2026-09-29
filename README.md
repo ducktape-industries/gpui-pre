@@ -60,13 +60,13 @@ No JavaScript import is replaced with a shim.
   `fastrand/js`, which imports getrandom's browser backend. Native targets
   and `web` retain flume defaults. Browser worker threads imply `web`.
 
-Consumers must patch `gpui-pre`, `gpui-pre-scheduler`, `gpui-pre-zlog` and
-`gpui-pre-wgpu` from the same fork revision. The two sibling packages live in `vendor/`;
-`README.ducktape.md` records each original crates.io archive SHA-256. Cargo
+Consumers must patch `gpui-pre` and every package in `vendor/` from the same
+fork revision. Each vendored package's `README.ducktape.md` records its
+original crates.io archive SHA-256. Cargo
 ignores dependency manifests' patch tables, so patches belong in each
 consumer workspace's `[patch.crates-io]` table, not this dependency.
 
-On a gpui-pre bump, refresh these two sibling sources and archive hashes,
+On a gpui-pre bump, refresh the scheduler and zlog sources and archive hashes,
 reapply the dependency feature/target gates and scheduler Instant cfg,
 and preserve the existing accessibility changes. Inspect the full wasm
 normal dependency tree for wasm-bindgen, js-sys, and web-sys; transitive
