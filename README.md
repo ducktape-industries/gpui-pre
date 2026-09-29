@@ -7,7 +7,7 @@
 3. `div: an aria_disabled setter on the element accessibility API` — `aria_disabled(bool)` beside `aria_selected`/`aria_expanded`/`aria_toggled`.
 4. `window: read the accessibility tree, its element ids, and dispatch an action at runtime` — `Window::a11y_tree()` (the last `TreeUpdate`, in every build), `Window::a11y_element_id(node)` (the `GlobalElementId` that built a node), `Window::dispatch_a11y_action(request)` (the adapter's own action path). Read-only accessors plus one public entry to the existing handler; nothing changes unless called.
 
-The later ones each have a section below: link wrapping, `Window::set_bounds`, bounds observers on full-screen/maximize, one tab stop per focus handle, refused accessibility nodes, the JavaScript-free wasm guest gates, and the vendored siblings (`vendor/`) those need.
+The later ones each have a section below: link wrapping, `Window::set_bounds`, bounds observers on full-screen/maximize, one tab stop per focus handle, refused accessibility nodes, the active-descendant claim gate, the JavaScript-free wasm guest gates, and the vendored siblings (`vendor/`) those need.
 
 **Why:** ducktape-app #114 gates merges on an accessibility contract (`ax_contract`) that reads every screen's AccessKit tree headless. Without (1) and (2) no headless test can see the tree: the test window dropped it and a window only built it once an adapter activated. (4) is for the app's opt-in loopback test door, which serves that same tree to a QA runner in a real (release) build and acts through the same path a screen reader does.
 
@@ -31,6 +31,10 @@ The later ones each have a section below: link wrapping, `Window::set_bounds`, b
 ### Refused accessibility nodes
 
 `Window::a11y_refused_elements()` lists the elements whose accessibility node the last frame with accessibility active left out because an earlier node had the same id, each with that shared `NodeId`, so `a11y_element_id(id)` names the element that kept it. A debug build still panics on the duplicate, so the list is empty there; a release build dropped such a node without a trace, and this lets the app's test door report it. `a_second_element_with_one_id_is_refused` pins it (run it with `--release`).
+
+### Active-descendant claim gate
+
+An `aria_active_descendant` claim counts only when the claimant's nearest focusable ancestor (the first node below it on the accessibility stack registered with `set_focusable`) is the focused node. Upstream honoured a claim under a focused ancestor at any depth, so a focused outer box (a held pane, a focusable frame) let every composite inside it claim: two claims panicked in debug ("active descendant claimed by multiple nodes") and the last won in release, telling assistive technology that a row of an unfocused composite had the focus. A focusable element with no role pushes no node and is passed over; it can never be the focused node either. `active_descendant_ignored_under_unfocused_focusable_ancestor`, `focused_composite_claim_wins_over_unfocused_one` and `focused_box_over_two_unfocused_composites_stays_focused` pin it.
 
 ### What the patch does (kept for a future reader)
 
