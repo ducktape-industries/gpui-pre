@@ -613,3 +613,83 @@ fn p7c_a_claim_under_an_outer_focus_survives_reuse(cx: &mut TestAppContext) {
     let reused = tree(&mut native);
     assert_eq!(reused.focus, row, "reused frame: the claim wins");
 }
+
+/// A cached view that owns a focus handle, or reads another view's.
+struct Stop {
+    renders: Count,
+    handle: FocusHandle,
+    /// The `is_focused` read of a handle this view did not render (P8's stale reader).
+    reads: Option<FocusHandle>,
+}
+
+impl Render for Stop {
+    fn render(&mut self, window: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        self.renders.set(self.renders.get() + 1);
+        let read = self.reads.as_ref().map(|h| h.is_focused(window));
+        div()
+            .size(px(20.))
+            .track_focus(&self.handle)
+            .child(format!("{:?} {read:?}", self.handle.is_focused(window)))
+    }
+}
+
+struct Stops {
+    renders: Count,
+    stops: Vec<Entity<Stop>>,
+}
+
+impl Render for Stops {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        self.renders.set(self.renders.get() + 1);
+        div().size_full().children(self.stops.iter().map(|stop| {
+            AnyView::from(stop.clone()).cached(StyleRefinement::default().size(px(20.)))
+        }))
+    }
+}
+
+/// P8 (F3): a focus move re-renders the views that rendered the old and the
+/// new focus ids, and the root over them; a cached sibling holding neither
+/// hits. A fourth cached view that reads C's handle without observing focus
+/// keeps its stale text (the s18 audit's class).
+#[gpui::test]
+fn p8_a_focus_move_re_renders_the_two_views_that_own_it(cx: &mut TestAppContext) {
+    let c: [Count; 5] = Default::default();
+    let k = c.clone();
+    let (root, mut native) = open(cx, move |cx| {
+        let stop = |i: usize, reads: Option<FocusHandle>, cx: &mut App| {
+            let handle = cx.focus_handle();
+            cx.new(|_| Stop {
+                renders: k[i].clone(),
+                handle,
+                reads,
+            })
+        };
+        let a = stop(1, None, cx);
+        let b = stop(2, None, cx);
+        let c = stop(3, None, cx);
+        let c_handle = c.read(cx).handle.clone();
+        let d = stop(4, Some(c_handle), cx);
+        Stops {
+            renders: k[0].clone(),
+            stops: vec![a, b, c, d],
+        }
+    });
+    let stops = root.read_with(&native, |root, _| root.stops.clone());
+    let handle =
+        |i: usize, native: &VisualTestContext| stops[i].read_with(native, |s, _| s.handle.clone());
+    let (b_handle, c_handle) = (handle(1, &native), handle(2, &native));
+    let before = counts(&c);
+    native.update(|window, cx| window.focus(&b_handle, cx));
+    native.run_until_parked();
+    let after_b = counts(&c);
+    native.update(|window, cx| window.focus(&c_handle, cx));
+    native.run_until_parked();
+    let after_c = counts(&c);
+    eprintln!(
+        "P8 [root, A, B, C, D reads C]: {before:?} -> focus(B) {after_b:?} -> focus(C) {after_c:?}"
+    );
+    assert_eq!(before, [1, 1, 1, 1, 1]);
+    assert_eq!(after_b, [2, 1, 2, 1, 1]);
+    assert_eq!(after_c, [3, 1, 3, 2, 1]);
+    assert!(native.update(|window, _| c_handle.is_focused(window)));
+}

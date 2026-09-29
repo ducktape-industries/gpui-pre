@@ -608,6 +608,19 @@ impl DispatchTree {
         self.focusable_node_ids.get(&target).copied()
     }
 
+    /// The nearest view that rendered the given focusable: the owner of the
+    /// focus-visible styling and key context a focus move redraws.
+    pub fn view_of_focusable(&self, target: FocusId) -> Option<EntityId> {
+        let mut node_id = self.focusable_node_id(target);
+        while let Some(node) = node_id.map(|id| self.node(id)) {
+            if node.view_id.is_some() {
+                return node.view_id;
+            }
+            node_id = node.parent;
+        }
+        None
+    }
+
     pub fn root_node_id(&self) -> DispatchNodeId {
         debug_assert!(!self.nodes.is_empty());
         DispatchNodeId(0)
