@@ -547,3 +547,69 @@ fn p7_a11y_nodes_survive_cache_reuse(cx: &mut TestAppContext) {
 fn p7b_a11y_nodes_survive_cache_reuse_through_a_deferred_child(cx: &mut TestAppContext) {
     a11y_nodes_survive_cache_reuse(cx, true);
 }
+
+struct Row {
+    renders: Count,
+}
+
+impl Render for Row {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        self.renders.set(self.renders.get() + 1);
+        div()
+            .id("row")
+            .role(Role::ListBoxOption)
+            .size(px(10.))
+            .aria_active_descendant()
+    }
+}
+
+struct ListShell {
+    list: FocusHandle,
+    row: Entity<Row>,
+    dot: Entity<Leaf>,
+}
+
+impl Render for ListShell {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .size_full()
+            .child(
+                div()
+                    .id("list")
+                    .role(Role::ListBox)
+                    .track_focus(&self.list)
+                    .size(px(40.))
+                    .child(
+                        AnyView::from(self.row.clone())
+                            .cached(StyleRefinement::default().size(px(10.))),
+                    ),
+            )
+            .child(self.dot.clone())
+    }
+}
+
+#[gpui::test]
+fn p7c_a_claim_under_an_outer_focus_survives_reuse(cx: &mut TestAppContext) {
+    let rows = Count::default();
+    let r = rows.clone();
+    let (root, mut native) = open(cx, move |cx| ListShell {
+        list: cx.focus_handle(),
+        row: cx.new(|_| Row { renders: r }),
+        dot: cx.new(|_| Leaf::new(&Count::default())),
+    });
+    native.update(|window, _| window.activate_a11y());
+    native.run_until_parked();
+    let list = root.read_with(&native, |r, _| r.list.clone());
+    native.update(|window, cx| window.focus(&list, cx));
+    native.run_until_parked();
+    let fresh = tree(&mut native);
+    let row = node_with_role(&fresh, Role::ListBoxOption);
+    assert_eq!(fresh.focus, row, "fresh frame: the claim wins");
+    let before = rows.get();
+    let dot = root.read_with(&native, |r, _| r.dot.clone());
+    dot.update(&mut native, |_, cx| cx.notify());
+    native.run_until_parked();
+    assert_eq!(rows.get(), before, "the row was reused");
+    let reused = tree(&mut native);
+    assert_eq!(reused.focus, row, "reused frame: the claim wins");
+}
