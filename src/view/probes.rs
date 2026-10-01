@@ -1,7 +1,8 @@
 //! The fork's view-cache semantics, pinned as numbers: which views render
 //! when a sibling, a child or a read model notifies, and (P7) that a cached
 //! view keeps its accessibility nodes, side entries, action listeners and
-//! focus while its prepaint is reused.
+//! focus while its prepaint is reused, and (P8) that a focus move re-renders
+//! the two views that own the old and the new focus, not the window.
 //!
 //! P1-P6 came from the shell-rewrite design probes; a per-view render counter
 //! is the only instrument.
@@ -600,11 +601,16 @@ fn p7c_a_claim_under_an_outer_focus_survives_reuse(cx: &mut TestAppContext) {
     native.update(|window, _| window.activate_a11y());
     native.run_until_parked();
     let list = root.read_with(&native, |r, _| r.list.clone());
+    let pre = rows.get();
     native.update(|window, cx| window.focus(&list, cx));
     native.run_until_parked();
+    assert_eq!(rows.get(), pre, "the focus frame reused the row");
     let fresh = tree(&mut native);
     let row = node_with_role(&fresh, Role::ListBoxOption);
-    assert_eq!(fresh.focus, row, "fresh frame: the claim wins");
+    assert_eq!(
+        fresh.focus, row,
+        "focus frame: the replayed claim is judged by this frame's focus"
+    );
     let before = rows.get();
     let dot = root.read_with(&native, |r, _| r.dot.clone());
     dot.update(&mut native, |_, cx| cx.notify());
@@ -746,5 +752,7 @@ fn p8b_blur_and_a_listener_move_re_render_two_views(cx: &mut TestAppContext) {
         [2, 0, 2, 1, 0],
         "listener move: B and C, not A or D"
     );
-    assert_eq!(d(after_blur), [3, 0, 2, 2, 0], "blur: C only");
+    let blur = std::array::from_fn::<u32, 5, _>(|i| after_blur[i] - after_fwd[i]);
+    assert_eq!(blur, [1, 0, 0, 1, 0], "blur: root and C only");
+    assert_eq!(d(after_blur), [3, 0, 2, 2, 0], "totals since the start");
 }
