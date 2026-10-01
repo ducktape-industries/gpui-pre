@@ -960,12 +960,16 @@ pub(crate) struct TooltipRequest {
     id: TooltipId,
     tooltip: AnyTooltip,
     layer: Option<TooltipLayer>,
+    /// The deferred draw prepainting when the tooltip was registered: a layered tooltip draws
+    /// inside it.
+    parent: Option<usize>,
 }
 
-/// Where the tooltips registered inside [`Window::with_tooltip_layer`] draw: among the deferred
-/// draws at `priority`, fitted inside and clipped to `mask`, so they paint and take clicks only
-/// there and never above a deferred draw of higher priority. A tooltip registered outside every
-/// layer draws above every deferred draw, unclipped, fitted to the window.
+/// Where the tooltips registered inside [`Window::with_tooltip_layer`] draw: as a deferred draw
+/// at `priority` inside the deferred draw their source was drawn in (among the root draws when
+/// none), fitted inside and clipped to `mask`, so they paint and take clicks only there and never
+/// above a sibling draw of higher priority. A tooltip registered outside every layer draws above
+/// every deferred draw, unclipped, fitted to the window.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TooltipLayer {
     /// The deferred-draw priority the tooltip draws at.
@@ -977,6 +981,9 @@ pub struct TooltipLayer {
 pub(crate) struct DeferredDraw {
     current_view: EntityId,
     priority: usize,
+    /// The deferred draw prepainting when this one was registered: this one paints and hits
+    /// inside it, among its siblings by priority (see [`Frame::deferred_draw_traversal_order`]).
+    parent: Option<usize>,
     parent_node: DispatchNodeId,
     element_id_stack: SmallVec<[ElementId; 32]>,
     text_style_stack: Vec<TextStyleRefinement>,
@@ -1122,8 +1129,8 @@ impl Frame {
 
     pub(crate) fn hit_test(&self, position: Point<Pixels>) -> HitTest {
         // Hit order is paint order, reversed. The deferred draws' hitboxes sit in `hitboxes` in
-        // prepaint order, round by round, but the draws paint by priority across every round, so
-        // they are walked draw by draw in paint order. Before them lie the root's (and the
+        // prepaint order, round by round, but the draws paint by priority among siblings, a draw
+        // after the draw it was made in, so they are walked draw by draw in paint order. Before them lie the root's (and the
         // inspector's) hitboxes, after them the prompt's or the drag's.
         let hitbox_range = |draw: &DeferredDraw| {
             draw.prepaint_range.start.hitboxes_index..draw.prepaint_range.end.hitboxes_index
@@ -1178,12 +1185,30 @@ impl Frame {
         hit_test
     }
 
-    /// The deferred draws in paint order: by priority across every round, in registration order
-    /// within one priority.
+    /// The deferred draws in paint order, a tree: by priority among siblings, in registration
+    /// order within one priority, a draw after the draw it was made in and before that draw's
+    /// next sibling. A draw made in a draw of lower priority than a sibling of its parent paints
+    /// under that sibling, whatever its own priority.
     fn deferred_draw_traversal_order(&self) -> SmallVec<[usize; 8]> {
-        let mut sorted_indices = (0..self.deferred_draws.len()).collect::<SmallVec<[_; 8]>>();
-        sorted_indices.sort_by_key(|ix| self.deferred_draws[*ix].priority);
-        sorted_indices
+        let draws = &self.deferred_draws;
+        let mut by_priority = (0..draws.len()).collect::<SmallVec<[usize; 8]>>();
+        by_priority.sort_by_key(|ix| draws[*ix].priority);
+        let mut roots = SmallVec::<[usize; 8]>::new();
+        let mut children: SmallVec<[SmallVec<[usize; 2]>; 8]> =
+            smallvec::smallvec![SmallVec::new(); draws.len()];
+        for ix in by_priority {
+            match draws[ix].parent {
+                Some(parent) => children[parent].push(ix),
+                None => roots.push(ix),
+            }
+        }
+        let mut order = SmallVec::with_capacity(draws.len());
+        let mut stack = roots.into_iter().rev().collect::<SmallVec<[usize; 8]>>();
+        while let Some(ix) = stack.pop() {
+            order.push(ix);
+            stack.extend(children[ix].iter().rev().copied());
+        }
+        order
     }
 
     pub(crate) fn focus_path(&self) -> SmallVec<[FocusId; 8]> {
@@ -1239,6 +1264,8 @@ pub struct Window {
     pub(crate) element_offset_stack: Vec<Point<Pixels>>,
     pub(crate) element_opacity: f32,
     pub(crate) tooltip_layer: Option<TooltipLayer>,
+    /// The deferred draw being prepainted: the parent of every draw and tooltip registered now.
+    prepainting_draw: Option<usize>,
     pub(crate) content_mask_stack: Vec<ContentMask<Pixels>>,
     pub(crate) requested_autoscroll: Option<Bounds<Pixels>>,
     /// The [`TextInputConfiguration`] most recently forwarded to the platform
@@ -2101,6 +2128,7 @@ impl Window {
             content_mask_stack: Vec::new(),
             element_opacity: 1.0,
             tooltip_layer: None,
+            prepainting_draw: None,
             requested_autoscroll: None,
             last_text_input_configuration: None,
             focused_text_input_active: false,
@@ -3592,6 +3620,8 @@ impl Window {
     fn draw_roots(&mut self, cx: &mut App) {
         self.invalidator.set_phase(DrawPhase::Prepaint);
         self.tooltip_bounds.take();
+        // a panic caught mid-round must not parent this frame's root draws to a dead index
+        self.prepainting_draw = None;
 
         self.a11y.sync_active_flag();
         if self.a11y.is_active() {
@@ -3776,11 +3806,17 @@ impl Window {
             let deferred_start = self.next_frame.deferred_draws.len();
             let root_node = self.next_frame.dispatch_tree.root_node_id();
             self.next_frame.dispatch_tree.set_active_node(root_node);
+            // a layered tooltip draws inside the draw its source was drawn in
+            let outer = mem::replace(
+                &mut self.prepainting_draw,
+                tooltip_request.layer.and(tooltip_request.parent),
+            );
             self.with_tooltip_layer(tooltip_request.layer, |window| {
                 window.with_rendered_view(tooltip_request.tooltip.view.entity_id(), |window| {
                     window.defer_draw(element, tooltip_bounds.origin, priority, content_mask)
                 })
             });
+            self.prepainting_draw = outer;
             self.prepaint_deferred_draws(deferred_start, cx);
 
             self.tooltip_bounds = Some(TooltipBounds {
@@ -3849,6 +3885,7 @@ impl Window {
                 };
                 self.next_frame.dispatch_tree.set_active_node(parent_node);
 
+                let outer = self.prepainting_draw.replace(deferred_draw_ix);
                 let prepaint_start = self.prepaint_index();
                 if let Some(mut element) = element {
                     self.with_rendered_view(current_view, |window| {
@@ -3869,6 +3906,7 @@ impl Window {
                 } else {
                     self.reuse_prepaint(prepaint_range);
                 }
+                self.prepainting_draw = outer;
                 let prepaint_end = self.prepaint_index();
                 self.next_frame.deferred_draws[deferred_draw_ix].prepaint_range =
                     prepaint_start..prepaint_end;
@@ -3937,11 +3975,18 @@ impl Window {
                 .iter()
                 .cloned(),
         );
+        // Replayed draws and tooltips sit inside the draw replaying them now, never inside last
+        // frame's index.
+        let parent = self.prepainting_draw;
         self.next_frame.tooltip_requests.extend(
             self.rendered_frame.tooltip_requests
                 [range.start.tooltips_index..range.end.tooltips_index]
                 .iter_mut()
-                .map(|request| request.take()),
+                .map(|request| {
+                    request
+                        .take()
+                        .map(|request| TooltipRequest { parent, ..request })
+                }),
         );
         self.next_frame.accessed_element_states.extend(
             self.rendered_frame.accessed_element_states[range.start.accessed_element_states_index
@@ -3979,6 +4024,7 @@ impl Window {
                 .iter()
                 .map(|deferred_draw| DeferredDraw {
                     current_view: deferred_draw.current_view,
+                    parent,
                     parent_node: reused_subtree.refresh_node_id(deferred_draw.parent_node),
                     element_id_stack: deferred_draw.element_id_stack.clone(),
                     text_style_stack: deferred_draw.text_style_stack.clone(),
@@ -4104,6 +4150,7 @@ impl Window {
             id,
             tooltip,
             layer: self.tooltip_layer,
+            parent: self.prepainting_draw,
         }));
         id
     }
@@ -4473,8 +4520,9 @@ impl Window {
     }
 
     /// Defers the drawing of the given element, scheduling it to be painted on top of the currently-drawn tree
-    /// at a later time. The `priority` parameter determines the drawing order relative to other deferred elements,
-    /// with higher values being drawn on top.
+    /// at a later time. The `priority` parameter determines the drawing order relative to other deferred elements
+    /// made in the same deferred draw (or at the root), with higher values being drawn on top; a draw made while
+    /// another prepaints draws inside it, right after it.
     ///
     /// When `content_mask` is provided, the deferred element will be clipped to that region during
     /// both prepaint and paint. When `None`, no additional clipping is applied.
@@ -4491,6 +4539,7 @@ impl Window {
         let parent_node = self.next_frame.dispatch_tree.active_node_id().unwrap();
         self.next_frame.deferred_draws.push(DeferredDraw {
             current_view: self.current_view(),
+            parent: self.prepainting_draw,
             parent_node,
             element_id_stack: self.element_id_stack.clone(),
             text_style_stack: self.text_style_stack.clone(),
