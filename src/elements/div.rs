@@ -3054,10 +3054,14 @@ impl Interactivity {
                     //
                     // This design avoids an ABA problem that happens if you
                     // store the focus handle that registered the keypress.
+                    //
+                    // A repeat (`is_held`) begins no press and leaves the record
+                    // as it is: a key held down since before this element had
+                    // the focus never clicks it on release.
                     window.on_key_event({
                         let pending_keyboard_down = pending_keyboard_down.clone();
                         move |event: &KeyDownEvent, phase, window, _cx| {
-                            if phase.bubble() && !window.default_prevented() {
+                            if phase.bubble() && !window.default_prevented() && !event.is_held {
                                 let stroke = &event.keystroke;
                                 let is_activation_key = (stroke.key.eq("enter")
                                     || stroke.key.eq("space"))
@@ -5405,6 +5409,23 @@ mod tests {
         .unwrap();
     }
 
+    /// The platform's repeat of `key`, held down.
+    fn key_repeat(cx: &mut TestAppContext, window: AnyWindowHandle, key: &str) {
+        let keystroke = Keystroke::parse(key).unwrap();
+        cx.update_window(window, |_, window, cx| {
+            window.dispatch_event(
+                KeyDownEvent {
+                    keystroke,
+                    is_held: true,
+                    prefer_character_input: false,
+                }
+                .to_platform_input(),
+                cx,
+            );
+        })
+        .unwrap();
+    }
+
     fn key_up(cx: &mut TestAppContext, window: AnyWindowHandle, key: &str) {
         let keystroke = Keystroke::parse(key).unwrap();
         cx.update_window(window, |_, window, cx| {
@@ -5524,6 +5545,41 @@ mod tests {
         key_up(&mut cx, window, "cmd-enter");
 
         assert!(clicks.borrow().is_empty(), "clicks: {:?}", clicks.borrow());
+    }
+
+    /// A key held down since before the element had the focus (a dialog
+    /// opened under a held Enter and its button took the keys) never clicks
+    /// it: the repeats that reach it begin no press, so its release finds
+    /// none.
+    #[test]
+    fn keyboard_activation_ignores_a_key_held_from_before_focus() {
+        let (mut cx, window, clicks, focus_a, focus_b) = setup_keyboard_activation_test();
+
+        focus_and_draw(&mut cx, window, &focus_b);
+        key_down(&mut cx, window, "enter");
+        focus_and_draw(&mut cx, window, &focus_a);
+        for _ in 0..3 {
+            key_repeat(&mut cx, window, "enter");
+        }
+        key_up(&mut cx, window, "enter");
+
+        assert!(clicks.borrow().is_empty(), "clicks: {:?}", clicks.borrow());
+    }
+
+    /// A press that began on the element and is held long enough to repeat
+    /// still clicks it once, on release.
+    #[test]
+    fn keyboard_activation_survives_its_own_repeats() {
+        let (mut cx, window, clicks, focus_a, _focus_b) = setup_keyboard_activation_test();
+
+        focus_and_draw(&mut cx, window, &focus_a);
+        key_down(&mut cx, window, "enter");
+        for _ in 0..3 {
+            key_repeat(&mut cx, window, "enter");
+        }
+        key_up(&mut cx, window, "enter");
+
+        assert_eq!(*clicks.borrow(), vec!["a"]);
     }
 
     /// Two sibling tab groups, each a focusable container that is *not* itself a
