@@ -4843,6 +4843,17 @@ impl Window {
         Ok(())
     }
 
+    /// The sprite atlas key [`Window::paint_svg`] rasterises `path` under when it paints it in
+    /// `bounds` in this window. [`Window::drop_svg`] takes that raster out of the atlas again.
+    pub fn svg_params(&self, bounds: Bounds<Pixels>, path: SharedString) -> RenderSvgParams {
+        RenderSvgParams {
+            path,
+            size: self.snap_bounds(bounds).size.map(|pixels| {
+                DevicePixels::from((pixels.0 * SMOOTH_SVG_SCALE_FACTOR).ceil() as i32)
+            }),
+        }
+    }
+
     /// Paint a monochrome SVG into the scene for the next frame at the current stacking context.
     ///
     /// This method should only be called as part of the paint phase of element drawing.
@@ -4858,14 +4869,8 @@ impl Window {
         self.invalidator.debug_assert_paint();
 
         let element_opacity = self.element_opacity();
+        let params = self.svg_params(bounds, path);
         let bounds = self.snap_bounds(bounds);
-
-        let params = RenderSvgParams {
-            path,
-            size: bounds.size.map(|pixels| {
-                DevicePixels::from((pixels.0 * SMOOTH_SVG_SCALE_FACTOR).ceil() as i32)
-            }),
-        };
 
         let Some(tile) =
             self.sprite_atlas
@@ -5047,6 +5052,11 @@ impl Window {
         Ok(())
     }
 
+    /// Removes an SVG raster from the sprite atlas: the one [`Window::svg_params`] names.
+    pub fn drop_svg(&mut self, params: RenderSvgParams) {
+        self.sprite_atlas.remove(&params.into());
+    }
+
     /// Returns whether every frame of an image is present in the sprite atlas.
     #[cfg(any(test, feature = "test-support"))]
     pub fn has_image_atlas_entry(&self, data: &RenderImage) -> bool {
@@ -5060,6 +5070,12 @@ impl Window {
                     .into(),
                 )
             })
+    }
+
+    /// Returns whether an SVG raster is present in the sprite atlas.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn has_svg_atlas_entry(&self, params: &RenderSvgParams) -> bool {
+        self.sprite_atlas.contains(&params.clone().into())
     }
 
     /// Add a node to the layout tree for the current frame. Takes the `Style` of the element for which
@@ -9239,6 +9255,112 @@ mod tests {
                 );
             })
             .unwrap();
+    }
+
+    /// A painted SVG's raster stays in the window's atlas until `drop_svg` names it by
+    /// `svg_params`, for a path and for data alike, and the next paint rasterises it again.
+    #[gpui::test]
+    fn a_dropped_svg_leaves_the_atlas_and_the_next_paint_rasterises_it(cx: &mut TestAppContext) {
+        use crate::{AssetSource, SharedString, Svg, SvgRenderer, black, svg};
+        use std::{
+            borrow::Cow,
+            sync::{
+                Arc,
+                atomic::{AtomicUsize, Ordering::SeqCst},
+            },
+        };
+
+        const ICON: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="4" height="3"><path d="M0 0h4v3H0z"/></svg>"#;
+
+        struct CountedIcon(Arc<AtomicUsize>);
+
+        impl AssetSource for CountedIcon {
+            fn load(&self, _: &str) -> anyhow::Result<Option<Cow<'static, [u8]>>> {
+                self.0.fetch_add(1, SeqCst);
+                Ok(Some(Cow::Borrowed(ICON)))
+            }
+
+            fn list(&self, _: &str) -> anyhow::Result<Vec<SharedString>> {
+                Ok(Vec::new())
+            }
+        }
+
+        struct Icons;
+
+        impl Render for Icons {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .size_full()
+                    .child(
+                        svg()
+                            .path("icon.svg")
+                            .absolute()
+                            .left(px(10.))
+                            .top(px(2.))
+                            .size(px(16.))
+                            .text_color(black()),
+                    )
+                    .child(
+                        svg()
+                            .data(ICON)
+                            .absolute()
+                            .left(px(40.))
+                            .top(px(2.))
+                            .w(px(12.))
+                            .h(px(9.))
+                            .text_color(black()),
+                    )
+            }
+        }
+
+        let loads = Arc::new(AtomicUsize::new(0));
+        cx.update(|cx| cx.svg_renderer = SvgRenderer::new(Arc::new(CountedIcon(loads.clone()))));
+        let window = cx.add_window(|_, _| Icons);
+        cx.update_window(window.into(), |_, window, cx| {
+            let keys = [
+                window.svg_params(
+                    Bounds::new(point(px(10.), px(2.)), size(px(16.), px(16.))),
+                    "icon.svg".into(),
+                ),
+                window.svg_params(
+                    Bounds::new(point(px(40.), px(2.)), size(px(12.), px(9.))),
+                    Svg::data_path(ICON),
+                ),
+            ];
+            window.draw(cx).clear(cx);
+            for key in &keys {
+                assert!(
+                    window.has_svg_atlas_entry(key),
+                    "{} is in the atlas",
+                    key.path
+                );
+            }
+            let loads_painted = loads.load(SeqCst);
+
+            for key in &keys {
+                window.drop_svg(key.clone());
+                assert!(
+                    !window.has_svg_atlas_entry(key),
+                    "{} left the atlas",
+                    key.path
+                );
+            }
+
+            window.draw(cx).clear(cx);
+            for key in &keys {
+                assert!(
+                    window.has_svg_atlas_entry(key),
+                    "{} was rasterised again",
+                    key.path
+                );
+            }
+            assert_eq!(
+                loads.load(SeqCst),
+                loads_painted + 1,
+                "the path SVG was read again to rasterise it"
+            );
+        })
+        .unwrap();
     }
 }
 

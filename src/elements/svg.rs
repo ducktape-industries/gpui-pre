@@ -51,14 +51,18 @@ impl Svg {
     /// Set the raw SVG data for this element.
     /// The SVG will be rendered directly from the provided bytes.
     pub fn data(mut self, data: &[u8]) -> Self {
+        self.data = Some(Arc::from(data));
+        self.data_path = Some(Self::data_path(data));
+        self
+    }
+
+    /// The path [`Svg::data`] paints `data` under, for [`Window::svg_params`].
+    pub fn data_path(data: &[u8]) -> SharedString {
         // Generate a unique deterministic path based on the data hash for caching
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         data.hash(&mut hasher);
         let hash = hasher.finish();
-        let path = SharedString::from(format!("__binary_svg__{}", hash));
-        self.data = Some(Arc::from(data));
-        self.data_path = Some(path);
-        self
+        SharedString::from(format!("__binary_svg__{}", hash))
     }
 
     /// Transform the SVG element with the given transformation.
