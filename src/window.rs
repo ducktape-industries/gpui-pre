@@ -959,6 +959,19 @@ pub(crate) struct TooltipBounds {
 pub(crate) struct TooltipRequest {
     id: TooltipId,
     tooltip: AnyTooltip,
+    layer: Option<TooltipLayer>,
+}
+
+/// Where the tooltips registered inside [`Window::with_tooltip_layer`] draw: among the deferred
+/// draws at `priority`, fitted inside and clipped to `mask`, so they paint and take clicks only
+/// there and never above a deferred draw of higher priority. A tooltip registered outside every
+/// layer draws above every deferred draw, unclipped, fitted to the window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TooltipLayer {
+    /// The deferred-draw priority the tooltip draws at.
+    pub priority: usize,
+    /// The region the tooltip is fitted inside and clipped to.
+    pub mask: ContentMask<Pixels>,
 }
 
 pub(crate) struct DeferredDraw {
@@ -968,6 +981,7 @@ pub(crate) struct DeferredDraw {
     element_id_stack: SmallVec<[ElementId; 32]>,
     text_style_stack: Vec<TextStyleRefinement>,
     content_mask: Option<ContentMask<Pixels>>,
+    tooltip_layer: Option<TooltipLayer>,
     rem_size: Pixels,
     element: Option<AnyElement>,
     absolute_offset: Point<Pixels>,
@@ -1107,9 +1121,43 @@ impl Frame {
     }
 
     pub(crate) fn hit_test(&self, position: Point<Pixels>) -> HitTest {
+        // Hit order is paint order, reversed. The deferred draws' hitboxes sit in `hitboxes` in
+        // prepaint order, round by round, but the draws paint by priority across every round, so
+        // they are walked draw by draw in paint order. Before them lie the root's (and the
+        // inspector's) hitboxes, after them the prompt's or the drag's.
+        let hitbox_range = |draw: &DeferredDraw| {
+            draw.prepaint_range.start.hitboxes_index..draw.prepaint_range.end.hitboxes_index
+        };
+        let deferred_start = self
+            .deferred_draws
+            .iter()
+            .map(|draw| hitbox_range(draw).start)
+            .min()
+            .unwrap_or(self.hitboxes.len());
+        let deferred_end = self
+            .deferred_draws
+            .iter()
+            .map(|draw| hitbox_range(draw).end)
+            .max()
+            .unwrap_or(deferred_start);
+        let deferred = self
+            .deferred_draw_traversal_order()
+            .into_iter()
+            .rev()
+            .flat_map(|ix| {
+                self.hitboxes[hitbox_range(&self.deferred_draws[ix])]
+                    .iter()
+                    .rev()
+            });
+        let hitboxes = self.hitboxes[deferred_end..]
+            .iter()
+            .rev()
+            .chain(deferred)
+            .chain(self.hitboxes[..deferred_start].iter().rev());
+
         let mut set_hover_hitbox_count = false;
         let mut hit_test = HitTest::default();
-        for hitbox in self.hitboxes.iter().rev() {
+        for hitbox in hitboxes {
             let bounds = hitbox.bounds.intersect(&hitbox.content_mask.bounds);
             if bounds.contains(&position) {
                 hit_test.ids.push(hitbox.id);
@@ -1128,6 +1176,14 @@ impl Frame {
             hit_test.hover_hitbox_count = hit_test.ids.len();
         }
         hit_test
+    }
+
+    /// The deferred draws in paint order: by priority across every round, in registration order
+    /// within one priority.
+    fn deferred_draw_traversal_order(&self) -> SmallVec<[usize; 8]> {
+        let mut sorted_indices = (0..self.deferred_draws.len()).collect::<SmallVec<[_; 8]>>();
+        sorted_indices.sort_by_key(|ix| self.deferred_draws[*ix].priority);
+        sorted_indices
     }
 
     pub(crate) fn focus_path(&self) -> SmallVec<[FocusId; 8]> {
@@ -1182,6 +1238,7 @@ pub struct Window {
     pub(crate) rendered_entity_stack: Vec<EntityId>,
     pub(crate) element_offset_stack: Vec<Point<Pixels>>,
     pub(crate) element_opacity: f32,
+    pub(crate) tooltip_layer: Option<TooltipLayer>,
     pub(crate) content_mask_stack: Vec<ContentMask<Pixels>>,
     pub(crate) requested_autoscroll: Option<Bounds<Pixels>>,
     /// The [`TextInputConfiguration`] most recently forwarded to the platform
@@ -2043,6 +2100,7 @@ impl Window {
             element_offset_stack: Vec::new(),
             content_mask_stack: Vec::new(),
             element_opacity: 1.0,
+            tooltip_layer: None,
             requested_autoscroll: None,
             last_text_input_configuration: None,
             focused_text_input_active: false,
@@ -3573,11 +3631,10 @@ impl Window {
         #[cfg(any(feature = "inspector", debug_assertions))]
         let inspector_element = self.prepaint_inspector(_inspector_width, cx);
 
-        self.prepaint_deferred_draws(cx);
+        self.prepaint_deferred_draws(0, cx);
 
         let mut prompt_element = None;
         let mut active_drag_element = None;
-        let mut tooltip_element = None;
         if let Some(prompt) = self.prompt.take() {
             let mut element = prompt.view.any_view().into_any_element();
             let prompt_layout_id = element.request_layout(self, cx);
@@ -3595,7 +3652,7 @@ impl Window {
             active_drag_element = Some(element);
             cx.active_drag = Some(active_drag);
         } else {
-            tooltip_element = self.prepaint_tooltip(cx);
+            self.prepaint_tooltip(cx);
         }
 
         self.mouse_hit_test = self.next_frame.hit_test(self.mouse_position);
@@ -3613,8 +3670,6 @@ impl Window {
             prompt_element.paint(self, cx);
         } else if let Some(mut drag_element) = active_drag_element {
             drag_element.paint(self, cx);
-        } else if let Some(mut tooltip_element) = tooltip_element {
-            tooltip_element.paint(self, cx);
         }
 
         #[cfg(any(feature = "inspector", debug_assertions))]
@@ -3651,7 +3706,9 @@ impl Window {
         }
     }
 
-    fn prepaint_tooltip(&mut self, cx: &mut App) -> Option<AnyElement> {
+    /// Prepaints the topmost visible tooltip as a deferred draw: in its [`TooltipLayer`], or
+    /// above every other deferred draw, unclipped, when it has none.
+    fn prepaint_tooltip(&mut self, cx: &mut App) {
         // Use indexing instead of iteration to avoid borrowing self for the duration of the loop.
         for tooltip_request_index in (0..self.next_frame.tooltip_requests.len()).rev() {
             let Some(Some(tooltip_request)) = self
@@ -3673,27 +3730,32 @@ impl Window {
                 origin: Point::default(),
                 size: self.viewport_size(),
             };
+            // A layered tooltip fits inside its layer's mask.
+            let limits = match tooltip_request.layer {
+                Some(layer) => layer.mask.bounds.intersect(&window_bounds),
+                None => window_bounds,
+            };
 
-            if tooltip_bounds.right() > window_bounds.right() {
+            if tooltip_bounds.right() > limits.right() {
                 let new_x = mouse_position.x - tooltip_bounds.size.width - px(1.);
-                if new_x >= Pixels::ZERO {
+                if new_x >= limits.left() {
                     tooltip_bounds.origin.x = new_x;
                 } else {
                     tooltip_bounds.origin.x = cmp::max(
-                        Pixels::ZERO,
-                        tooltip_bounds.origin.x - tooltip_bounds.right() - window_bounds.right(),
+                        limits.left(),
+                        tooltip_bounds.origin.x - tooltip_bounds.right() - limits.right(),
                     );
                 }
             }
 
-            if tooltip_bounds.bottom() > window_bounds.bottom() {
+            if tooltip_bounds.bottom() > limits.bottom() {
                 let new_y = mouse_position.y - tooltip_bounds.size.height - px(1.);
-                if new_y >= Pixels::ZERO {
+                if new_y >= limits.top() {
                     tooltip_bounds.origin.y = new_y;
                 } else {
                     tooltip_bounds.origin.y = cmp::max(
-                        Pixels::ZERO,
-                        tooltip_bounds.origin.y - tooltip_bounds.bottom() - window_bounds.bottom(),
+                        limits.top(),
+                        tooltip_bounds.origin.y - tooltip_bounds.bottom() - limits.bottom(),
                     );
                 }
             }
@@ -3707,20 +3769,30 @@ impl Window {
                 continue;
             }
 
-            self.with_absolute_element_offset(tooltip_bounds.origin, |window| {
-                element.prepaint(window, cx)
+            let (priority, content_mask) = match tooltip_request.layer {
+                Some(layer) => (layer.priority, Some(layer.mask)),
+                None => (usize::MAX, None),
+            };
+            let deferred_start = self.next_frame.deferred_draws.len();
+            let root_node = self.next_frame.dispatch_tree.root_node_id();
+            self.next_frame.dispatch_tree.set_active_node(root_node);
+            self.with_tooltip_layer(tooltip_request.layer, |window| {
+                window.with_rendered_view(tooltip_request.tooltip.view.entity_id(), |window| {
+                    window.defer_draw(element, tooltip_bounds.origin, priority, content_mask)
+                })
             });
+            self.prepaint_deferred_draws(deferred_start, cx);
 
             self.tooltip_bounds = Some(TooltipBounds {
                 id: tooltip_request.id,
                 bounds: tooltip_bounds,
             });
-            return Some(element);
+            return;
         }
-        None
     }
 
-    fn prepaint_deferred_draws(&mut self, cx: &mut App) {
+    /// Prepaints the deferred draws from index `from` on, round by round.
+    fn prepaint_deferred_draws(&mut self, from: usize, cx: &mut App) {
         assert_eq!(self.element_id_stack.len(), 0);
 
         // Process deferred draws in multiple rounds to support nesting.
@@ -3733,7 +3805,7 @@ impl Window {
         // slices on the next frame. Moving the draws out and re-appending them
         // shifts the indices of nested draws, causing reused subtrees to graft
         // the wrong deferred draws and panic in the dispatch tree.
-        let mut round_start = 0;
+        let mut round_start = from;
         let mut depth = 0;
         loop {
             let round_end = self.next_frame.deferred_draws.len();
@@ -3749,7 +3821,16 @@ impl Window {
             traversal_order.sort_by_key(|ix| self.next_frame.deferred_draws[*ix].priority);
 
             for deferred_draw_ix in traversal_order {
-                let (element, parent_node, current_view, rem_size, absolute_offset, prepaint_range) = {
+                let (
+                    element,
+                    parent_node,
+                    current_view,
+                    rem_size,
+                    absolute_offset,
+                    content_mask,
+                    tooltip_layer,
+                    prepaint_range,
+                ) = {
                     let deferred_draw = &mut self.next_frame.deferred_draws[deferred_draw_ix];
                     self.element_id_stack
                         .clone_from(&deferred_draw.element_id_stack);
@@ -3761,6 +3842,8 @@ impl Window {
                         deferred_draw.current_view,
                         deferred_draw.rem_size,
                         deferred_draw.absolute_offset,
+                        deferred_draw.content_mask,
+                        deferred_draw.tooltip_layer,
                         deferred_draw.prepaint_range.clone(),
                     )
                 };
@@ -3769,9 +3852,16 @@ impl Window {
                 let prepaint_start = self.prepaint_index();
                 if let Some(mut element) = element {
                     self.with_rendered_view(current_view, |window| {
-                        window.with_rem_size(Some(rem_size), |window| {
-                            window.with_absolute_element_offset(absolute_offset, |window| {
-                                element.prepaint(window, cx);
+                        window.with_content_mask(content_mask, |window| {
+                            window.with_tooltip_layer(tooltip_layer, |window| {
+                                window.with_rem_size(Some(rem_size), |window| {
+                                    window.with_absolute_element_offset(
+                                        absolute_offset,
+                                        |window| {
+                                            element.prepaint(window, cx);
+                                        },
+                                    );
+                                });
                             });
                         });
                     });
@@ -3799,7 +3889,7 @@ impl Window {
             return;
         }
 
-        let traversal_order = self.deferred_draw_traversal_order();
+        let traversal_order = self.next_frame.deferred_draw_traversal_order();
         let mut deferred_draws = mem::take(&mut self.next_frame.deferred_draws);
         for deferred_draw_ix in traversal_order {
             let mut deferred_draw = &mut deferred_draws[deferred_draw_ix];
@@ -3827,13 +3917,6 @@ impl Window {
         }
         self.next_frame.deferred_draws = deferred_draws;
         self.element_id_stack.clear();
-    }
-
-    fn deferred_draw_traversal_order(&mut self) -> SmallVec<[usize; 8]> {
-        let deferred_count = self.next_frame.deferred_draws.len();
-        let mut sorted_indices = (0..deferred_count).collect::<SmallVec<[_; 8]>>();
-        sorted_indices.sort_by_key(|ix| self.next_frame.deferred_draws[*ix].priority);
-        sorted_indices
     }
 
     pub(crate) fn prepaint_index(&self) -> PrepaintStateIndex {
@@ -3900,6 +3983,7 @@ impl Window {
                     element_id_stack: deferred_draw.element_id_stack.clone(),
                     text_style_stack: deferred_draw.text_style_stack.clone(),
                     content_mask: deferred_draw.content_mask,
+                    tooltip_layer: deferred_draw.tooltip_layer,
                     rem_size: deferred_draw.rem_size,
                     priority: deferred_draw.priority,
                     element: None,
@@ -4010,15 +4094,44 @@ impl Window {
         })
     }
 
-    /// Sets a tooltip to be rendered for the upcoming frame. This method should only be called
-    /// during the paint phase of element drawing.
+    /// Sets a tooltip to be rendered for the upcoming frame, in the current
+    /// [`TooltipLayer`] if any. This method should only be called during the paint phase of
+    /// element drawing.
     pub fn set_tooltip(&mut self, tooltip: AnyTooltip) -> TooltipId {
         self.invalidator.debug_assert_prepaint();
         let id = TooltipId(post_inc(&mut self.next_tooltip_id.0));
-        self.next_frame
-            .tooltip_requests
-            .push(Some(TooltipRequest { id, tooltip }));
+        self.next_frame.tooltip_requests.push(Some(TooltipRequest {
+            id,
+            tooltip,
+            layer: self.tooltip_layer,
+        }));
         id
+    }
+
+    /// Invoke the given function with the given tooltip layer: every tooltip registered inside
+    /// it, and inside the deferred draws it registers, draws in that layer (see [`TooltipLayer`]).
+    /// `None` keeps the current layer. This method should only be called during the prepaint
+    /// phase of element drawing.
+    pub fn with_tooltip_layer<R>(
+        &mut self,
+        layer: Option<TooltipLayer>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.invalidator.debug_assert_prepaint();
+        let Some(layer) = layer else {
+            return f(self);
+        };
+        let previous = self.tooltip_layer.replace(layer);
+        let result = f(self);
+        self.tooltip_layer = previous;
+        result
+    }
+
+    /// The tooltip layer in effect, if any. This method should only be called during the prepaint
+    /// phase of element drawing.
+    pub fn tooltip_layer(&self) -> Option<TooltipLayer> {
+        self.invalidator.debug_assert_prepaint();
+        self.tooltip_layer
     }
 
     /// Invoke the given function with the given content mask after intersecting it
@@ -4382,6 +4495,7 @@ impl Window {
             element_id_stack: self.element_id_stack.clone(),
             text_style_stack: self.text_style_stack.clone(),
             content_mask,
+            tooltip_layer: self.tooltip_layer,
             rem_size: self.rem_size(),
             priority,
             element: Some(element),

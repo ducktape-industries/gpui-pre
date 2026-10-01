@@ -5671,4 +5671,413 @@ mod tests {
         assert_eq!(bounds("cell-1").origin.x, px(100.));
         assert_eq!(bounds("cell-2").origin.x, px(300.));
     }
+
+    type ClickLog = Rc<RefCell<Vec<&'static str>>>;
+
+    const TIP_COLOR: u32 = 0x00ff00;
+    const DIALOG_COLOR: u32 = 0xff0000;
+    const MARK_COLOR: u32 = 0xffff00;
+
+    /// A tooltip: an occluding box that logs its clicks.
+    struct ClickTip {
+        size: Size<Pixels>,
+        log: ClickLog,
+    }
+
+    impl Render for ClickTip {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let log = self.log.clone();
+            div()
+                .id("tip")
+                .w(self.size.width)
+                .h(self.size.height)
+                .bg(crate::rgb(TIP_COLOR))
+                .occlude()
+                .on_click(move |_, _, _| log.borrow_mut().push("tip"))
+        }
+    }
+
+    fn click_tip_source(
+        id: &'static str,
+        tip_size: Size<Pixels>,
+        hoverable: bool,
+        log: &ClickLog,
+    ) -> Stateful<Div> {
+        let log = log.clone();
+        let build = move |_: &mut Window, cx: &mut App| -> AnyView {
+            let log = log.clone();
+            cx.new(|_| ClickTip {
+                size: tip_size,
+                log,
+            })
+            .into()
+        };
+        let source = div().id(id).size_full();
+        if hoverable {
+            source.hoverable_tooltip(build)
+        } else {
+            source.tooltip(build)
+        }
+    }
+
+    /// Prepaints its child in a tooltip layer at `priority`, masked to its own bounds, as a host
+    /// does for a view's pane.
+    struct LayerBox {
+        priority: usize,
+        child: AnyElement,
+    }
+
+    impl IntoElement for LayerBox {
+        type Element = Self;
+
+        fn into_element(self) -> Self {
+            self
+        }
+    }
+
+    impl Element for LayerBox {
+        type RequestLayoutState = ();
+        type PrepaintState = ();
+
+        fn id(&self) -> Option<ElementId> {
+            None
+        }
+
+        fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+            None
+        }
+
+        fn request_layout(
+            &mut self,
+            _: Option<&GlobalElementId>,
+            _: Option<&InspectorElementId>,
+            window: &mut Window,
+            cx: &mut App,
+        ) -> (LayoutId, ()) {
+            (self.child.request_layout(window, cx), ())
+        }
+
+        fn prepaint(
+            &mut self,
+            _: Option<&GlobalElementId>,
+            _: Option<&InspectorElementId>,
+            bounds: Bounds<Pixels>,
+            _: &mut (),
+            window: &mut Window,
+            cx: &mut App,
+        ) {
+            let layer = crate::TooltipLayer {
+                priority: self.priority,
+                mask: crate::ContentMask { bounds },
+            };
+            window.with_tooltip_layer(Some(layer), |window| self.child.prepaint(window, cx));
+        }
+
+        fn paint(
+            &mut self,
+            _: Option<&GlobalElementId>,
+            _: Option<&InspectorElementId>,
+            _: Bounds<Pixels>,
+            _: &mut (),
+            _: &mut (),
+            window: &mut Window,
+            cx: &mut App,
+        ) {
+            self.child.paint(window, cx);
+        }
+    }
+
+    /// The pane in a tooltip layer at `priority`, or the pane as is.
+    fn pane_in_layer(priority: Option<usize>, pane: impl IntoElement) -> AnyElement {
+        match priority {
+            Some(priority) => LayerBox {
+                priority,
+                child: pane.into_any_element(),
+            }
+            .into_any_element(),
+            None => pane.into_any_element(),
+        }
+    }
+
+    /// Hovers `at` until the tooltip there shows, and draws.
+    fn show_tooltip(cx: &mut crate::VisualTestContext, at: Point<Pixels>) {
+        cx.simulate_mouse_move(at, None, crate::Modifiers::none());
+        cx.executor().advance_clock(DEFAULT_TOOLTIP_SHOW_DELAY);
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+    }
+
+    fn quad_of(cx: &mut crate::VisualTestContext, color: u32) -> Option<crate::Quad> {
+        cx.update(|window, _| {
+            window
+                .painted_quads()
+                .into_iter()
+                .find(|quad| quad.background.as_solid() == Some(crate::rgb(color).into()))
+        })
+    }
+
+    struct DialogOverTooltipView {
+        layer: Option<usize>,
+        source_in_deferred: bool,
+        hoverable: bool,
+        log: ClickLog,
+    }
+
+    impl Render for DialogOverTooltipView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let source = div().size(px(20.)).child(click_tip_source(
+                "source",
+                size(px(60.), px(60.)),
+                self.hoverable,
+                &self.log,
+            ));
+            let source = if self.source_in_deferred {
+                crate::deferred(source).into_any_element()
+            } else {
+                source.into_any_element()
+            };
+            let log = self.log.clone();
+            div()
+                .size_full()
+                .child(pane_in_layer(self.layer, div().size_full().child(source)))
+                .child(
+                    crate::deferred(
+                        div()
+                            .id("dialog")
+                            .absolute()
+                            .left(px(30.))
+                            .top(px(30.))
+                            .size(px(100.))
+                            .bg(crate::rgb(DIALOG_COLOR))
+                            .occlude()
+                            .on_click(move |_, _, _| log.borrow_mut().push("dialog")),
+                    )
+                    .with_priority(2),
+                )
+        }
+    }
+
+    /// A tooltip, hoverable or plain, registered in a layer at priority 1 draws among the
+    /// deferred draws there: under a priority-2 draw that opens over it, which takes the click on
+    /// the spot they share. So does one whose source sits in a deferred draw made inside the
+    /// layer. A tooltip outside every layer still paints above every deferred draw and takes the
+    /// press: a hoverable one its click; a plain one hides once the pointer has left its source,
+    /// so no click lands.
+    #[gpui::test]
+    fn a_layered_tooltip_paints_and_takes_clicks_under_a_higher_deferred_draw(
+        cx: &mut TestAppContext,
+    ) {
+        for layer in [Some(1), None] {
+            for source_in_deferred in [false, true] {
+                for hoverable in [false, true] {
+                    let case = format!(
+                        "layer {layer:?}, source in a deferred draw: {source_in_deferred}, \
+                         hoverable: {hoverable}"
+                    );
+                    let log = ClickLog::default();
+                    let (_, cx) = cx.add_window_view({
+                        let log = log.clone();
+                        move |_, _| DialogOverTooltipView {
+                            layer,
+                            source_in_deferred,
+                            hoverable,
+                            log,
+                        }
+                    });
+                    cx.run_until_parked();
+                    show_tooltip(cx, point(px(10.), px(10.)));
+
+                    let tip = quad_of(cx, TIP_COLOR)
+                        .unwrap_or_else(|| panic!("{case}: the tooltip shows"));
+                    let dialog = quad_of(cx, DIALOG_COLOR)
+                        .unwrap_or_else(|| panic!("{case}: the dialog paints"));
+                    assert_eq!(
+                        tip.order > dialog.order,
+                        layer.is_none(),
+                        "{case}: the tooltip paints above the dialog"
+                    );
+
+                    cx.simulate_click(point(px(50.), px(50.)), crate::Modifiers::none());
+                    let clicked: &[&str] = match (layer, hoverable) {
+                        (Some(_), _) => &["dialog"],
+                        (None, true) => &["tip"],
+                        (None, false) => &[],
+                    };
+                    assert_eq!(
+                        *log.borrow(),
+                        clicked,
+                        "{case}: the click on the shared spot"
+                    );
+                }
+            }
+        }
+    }
+
+    struct TooltipNearPaneEdgeView {
+        layer: Option<usize>,
+        log: ClickLog,
+    }
+
+    impl Render for TooltipNearPaneEdgeView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let list = div()
+                .absolute()
+                .left(px(150.))
+                .size(px(40.))
+                .overflow_hidden()
+                .child(click_tip_source(
+                    "row",
+                    size(px(100.), px(30.)),
+                    false,
+                    &self.log,
+                ));
+            div().size_full().child(pane_in_layer(
+                self.layer,
+                div().relative().size(px(200.)).child(list),
+            ))
+        }
+    }
+
+    /// A layered tooltip is fitted inside its layer's mask and clipped to it, not to its source's
+    /// clip: on a row of a 40px list near the right edge of a 200px pane, a 100px tooltip flips
+    /// left of the pointer and draws whole, out of the list, inside the pane. Outside every
+    /// layer it opens right of the pointer, fitted to the window.
+    #[gpui::test]
+    fn a_layered_tooltip_fits_inside_its_layer_mask_not_its_sources_clip(cx: &mut TestAppContext) {
+        let pane = Bounds::new(point(px(0.), px(0.)), size(px(200.), px(200.)));
+        for (layer, origin) in [
+            (Some(1), point(px(69.), px(11.))),
+            (None, point(px(171.), px(11.))),
+        ] {
+            let (_, cx) = cx.add_window_view(move |_, _| TooltipNearPaneEdgeView {
+                layer,
+                log: ClickLog::default(),
+            });
+            cx.run_until_parked();
+            show_tooltip(cx, point(px(170.), px(10.)));
+
+            let (scale, viewport) =
+                cx.update(|window, _| (window.scale_factor(), window.viewport_size()));
+            let tip = quad_of(cx, TIP_COLOR)
+                .unwrap_or_else(|| panic!("layer {layer:?}: the tooltip shows"));
+            assert_eq!(
+                tip.bounds,
+                Bounds::new(origin, size(px(100.), px(30.))).scale(scale),
+                "layer {layer:?}: tooltip bounds"
+            );
+            let mask = match layer {
+                Some(_) => pane,
+                None => Bounds::new(point(px(0.), px(0.)), viewport),
+            };
+            assert_eq!(
+                tip.content_mask.bounds,
+                mask.scale(scale),
+                "layer {layer:?}: tooltip mask"
+            );
+        }
+    }
+
+    struct RowList(ClickLog);
+
+    impl Render for RowList {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().child(click_tip_source(
+                "row",
+                size(px(100.), px(30.)),
+                false,
+                &self.0,
+            ))
+        }
+    }
+
+    struct ShrinkingPaneView {
+        pane_width: Pixels,
+        list: Entity<RowList>,
+    }
+
+    impl Render for ShrinkingPaneView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let list = div()
+                .absolute()
+                .left(px(150.))
+                .size(px(40.))
+                .overflow_hidden()
+                .child(
+                    self.list
+                        .clone()
+                        .cached(StyleRefinement::default().size_full()),
+                );
+            div().size_full().child(pane_in_layer(
+                Some(1),
+                div().relative().w(self.pane_width).h(px(200.)).child(list),
+            ))
+        }
+    }
+
+    /// A cached view whose bounds and clip stay put while its tooltip layer changes is drawn
+    /// anew, so its tooltip takes the new layer: a pane that shrinks from 400px to 200px around
+    /// an unchanged list refits the row's tooltip inside 200px.
+    #[gpui::test]
+    fn a_cached_views_tooltip_takes_the_layer_it_is_drawn_in_now(cx: &mut TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, cx| ShrinkingPaneView {
+            pane_width: px(400.),
+            list: cx.new(|_| RowList(ClickLog::default())),
+        });
+        cx.run_until_parked();
+        show_tooltip(cx, point(px(170.), px(10.)));
+        let scale = cx.update(|window, _| window.scale_factor());
+        let tip = quad_of(cx, TIP_COLOR).expect("the tooltip shows");
+        assert_eq!(tip.bounds.origin, point(px(171.), px(11.)).scale(scale));
+
+        view.update(cx, |view, cx| {
+            view.pane_width = px(200.);
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+
+        let tip = quad_of(cx, TIP_COLOR).expect("the tooltip still shows");
+        assert_eq!(tip.bounds.origin, point(px(69.), px(11.)).scale(scale));
+        assert_eq!(
+            tip.content_mask.bounds,
+            Bounds::new(point(px(0.), px(0.)), size(px(200.), px(200.))).scale(scale)
+        );
+    }
+
+    struct DeferringTip;
+
+    impl Render for DeferringTip {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div().size(px(40.)).child(crate::deferred(
+                div().size(px(20.)).bg(crate::rgb(MARK_COLOR)),
+            ))
+        }
+    }
+
+    struct DeferringTipSource;
+
+    impl Render for DeferringTipSource {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div().size(px(20.)).child(
+                div()
+                    .id("source")
+                    .size_full()
+                    .tooltip(|_, cx| cx.new(|_| DeferringTip).into()),
+            )
+        }
+    }
+
+    /// A deferred draw inside a tooltip is prepainted, like any nested deferred draw, so it
+    /// paints.
+    #[gpui::test]
+    fn a_deferred_draw_inside_a_tooltip_paints(cx: &mut TestAppContext) {
+        let (_, cx) = cx.add_window_view(|_, _| DeferringTipSource);
+        cx.run_until_parked();
+        show_tooltip(cx, point(px(10.), px(10.)));
+
+        assert!(
+            quad_of(cx, MARK_COLOR).is_some(),
+            "the deferred draw paints"
+        );
+    }
 }
