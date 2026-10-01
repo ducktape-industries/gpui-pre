@@ -2565,6 +2565,13 @@ impl Interactivity {
                                         if let Some(focus_handle) = &self.tracked_focus_handle {
                                             window.next_frame.tab_stops.insert(focus_handle);
                                         }
+                                        if window.a11y.is_active()
+                                            && let Some(global_id) = global_id
+                                        {
+                                            self.paint_a11y_action_listeners(
+                                                global_id, bounds, window,
+                                            );
+                                        }
                                         if let Some(hitbox) = hitbox {
                                             #[cfg(debug_assertions)]
                                             self.paint_debug_info(
@@ -2603,21 +2610,6 @@ impl Interactivity {
 
                                         self.paint_keyboard_listeners(window, cx);
 
-                                        if window.a11y.is_active() {
-                                            if let Some(global_id) = global_id {
-                                                if !self.a11y_action_listeners.is_empty() {
-                                                    let node_id = global_id.accesskit_node_id();
-                                                    for (action, listener) in
-                                                        self.a11y_action_listeners.drain(..)
-                                                    {
-                                                        window.on_a11y_action(
-                                                            node_id, action, listener,
-                                                        );
-                                                    }
-                                                }
-                                            }
-                                        }
-
                                         f(&style, window, cx);
 
                                         if let Some(_hitbox) = hitbox {
@@ -2642,6 +2634,39 @@ impl Interactivity {
                 ((), element_state)
             },
         );
+    }
+
+    /// Registers this element's accessibility action listeners. The Click
+    /// it advertises for its click listeners is answered by those listeners,
+    /// as a keyboard Enter on the focused element is, unless the element
+    /// answers Click itself: no pointer press is synthesized, so a node that
+    /// is scrolled out of view, clipped or covered is still the one clicked.
+    fn paint_a11y_action_listeners(
+        &mut self,
+        global_id: &GlobalElementId,
+        bounds: Bounds<Pixels>,
+        window: &mut Window,
+    ) {
+        let node_id = global_id.accesskit_node_id();
+        let answers_click = self
+            .a11y_action_listeners
+            .iter()
+            .any(|(action, _)| *action == accesskit::Action::Click);
+        if !answers_click && !self.click_listeners.is_empty() {
+            let click_listeners = self.click_listeners.clone();
+            window.on_a11y_action(node_id, accesskit::Action::Click, move |_, window, cx| {
+                let click_event = ClickEvent::Keyboard(KeyboardClickEvent {
+                    button: KeyboardButton::Enter,
+                    bounds,
+                });
+                for listener in &click_listeners {
+                    listener(&click_event, window, cx);
+                }
+            });
+        }
+        for (action, listener) in self.a11y_action_listeners.drain(..) {
+            window.on_a11y_action(node_id, action, listener);
+        }
     }
 
     #[cfg(debug_assertions)]
