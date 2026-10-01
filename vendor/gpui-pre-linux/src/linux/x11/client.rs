@@ -219,6 +219,11 @@ pub struct X11ClientState {
     pub(crate) pre_edit_text: Option<String>,
     pub(crate) composing: bool,
     pub(crate) pre_key_char_down: Option<Keystroke>,
+    /// The keys pressed in this client's windows and not released yet. X11
+    /// sends a held key's auto-repeat as one more press (with detectable
+    /// auto-repeat, set at connect, no release comes before it): a press of a
+    /// key already down is that repeat, `is_held`.
+    pub(crate) keys_down: HashSet<xproto::Keycode>,
     pub(crate) cursor_handle: cursor::Handle,
     pub(crate) cursor_styles: HashMap<xproto::Window, CursorStyle>,
     pub(crate) cursor_cache: HashMap<CursorStyle, Option<xproto::Cursor>>,
@@ -438,6 +443,22 @@ impl X11Client {
                 &xkb::SelectEventsAux::new(),
             ),
         )?;
+        // A held key repeats as presses alone, with no release before each
+        // (XKB detectable auto-repeat), so a press of a key already down is
+        // the repeat (`keys_down`). A server that refuses it puts a release
+        // before each repeat, which `process_x11_events` drops by its timing.
+        get_reply(
+            || "Failed to set XKB detectable auto-repeat",
+            xcb_connection.xkb_per_client_flags(
+                xkb::ID::USE_CORE_KBD.into(),
+                xkb::PerClientFlag::DETECTABLE_AUTO_REPEAT,
+                xkb::PerClientFlag::DETECTABLE_AUTO_REPEAT,
+                0u32.into(),
+                0u32.into(),
+                0u32.into(),
+            ),
+        )
+        .log_err();
 
         let xkb_context = new_xkb_context()?;
         let xkb_device_id = xkbc::x11::get_core_keyboard_device_id(&xcb_connection);
@@ -562,6 +583,7 @@ impl X11Client {
             compose_state,
             pre_edit_text: None,
             pre_key_char_down: None,
+            keys_down: HashSet::default(),
             composing: false,
 
             cursor_handle,
@@ -1005,6 +1027,9 @@ impl X11Client {
                 // Set last scroll values to `None` so that a large delta isn't created if scrolling is done outside the window (the valuator is global)
                 reset_all_pointer_device_scroll_positions(&mut state.pointer_device_states);
                 state.keyboard_focused_window = None;
+                // a key released while another window has the keys sends no
+                // release here: its next press is a new one
+                state.keys_down.clear();
                 if let Some(compose_state) = state.compose_state.as_mut() {
                     compose_state.reset();
                 }
@@ -1075,6 +1100,7 @@ impl X11Client {
             Event::KeyPress(event) => {
                 let window = self.get_window(event.event)?;
                 let mut state = self.0.borrow_mut();
+                let is_held = !state.keys_down.insert(event.detail);
 
                 let modifiers = modifiers_from_state(event.state);
                 state.modifiers = modifiers;
@@ -1132,13 +1158,14 @@ impl X11Client {
                 drop(state);
                 window.handle_input(PlatformInput::KeyDown(gpui::KeyDownEvent {
                     keystroke,
-                    is_held: false,
+                    is_held,
                     prefer_character_input: false,
                 }));
             }
             Event::KeyRelease(event) => {
                 let window = self.get_window(event.event)?;
                 let mut state = self.0.borrow_mut();
+                state.keys_down.remove(&event.detail);
 
                 let modifiers = modifiers_from_state(event.state);
                 state.modifiers = modifiers;
