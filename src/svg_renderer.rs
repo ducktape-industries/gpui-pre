@@ -2,12 +2,12 @@ use crate::{
     AssetSource, DevicePixels, IsZero, RenderImage, Result, SharedString, Size,
     swap_rgba_pa_to_bgra,
 };
-use image::{Frame, ImageFormat};
+use image::{Frame, ImageFormat, ImageReader};
 use resvg::tiny_skia::Pixmap;
 use smallvec::SmallVec;
 use std::{
     hash::Hash,
-    io::Read,
+    io::{Cursor, Read},
     sync::{Arc, LazyLock, OnceLock},
 };
 
@@ -297,10 +297,18 @@ fn parse_tree(bytes: &[u8], options: &usvg::Options) -> Result<usvg::Tree, usvg:
     usvg::Tree::from_str(text, options)
 }
 
+/// The widest or tallest raster an SVG data URL may declare: the rasterizer's
+/// own cap (`rasterize_tree`'s `MAX_SIZE`).
+const MAX_RASTER_SIDE: u32 = 8192;
+/// The most pixels an SVG data URL raster may declare: 64 MiB of RGBA.
+const MAX_RASTER_PIXELS: u64 = 1 << 24;
+
 /// An `<image>` or `<feImage>` data URL resolves to a raster image only, as
 /// usvg's default does for rasters. A nested SVG (`image/svg+xml`, or
 /// `text/plain` without raster magic) is refused: usvg would parse it, and
-/// inflate it without a bound when it is gzip.
+/// inflate it without a bound when it is gzip. A raster whose header declares
+/// more than [`MAX_RASTER_SIDE`] a side or [`MAX_RASTER_PIXELS`] is refused
+/// too: resvg decodes it whole, and a small WebP or JPEG can declare 1 GiB.
 fn raster_data_href(mime: &str, data: Arc<Vec<u8>>, _: &usvg::Options) -> Option<usvg::ImageKind> {
     let format = match mime {
         "image/jpg" | "image/jpeg" => ImageFormat::Jpeg,
@@ -310,13 +318,25 @@ fn raster_data_href(mime: &str, data: Arc<Vec<u8>>, _: &usvg::Options) -> Option
         "text/plain" => image::guess_format(&data).ok()?,
         _ => return None,
     };
-    match format {
-        ImageFormat::Jpeg => Some(usvg::ImageKind::JPEG(data)),
-        ImageFormat::Png => Some(usvg::ImageKind::PNG(data)),
-        ImageFormat::Gif => Some(usvg::ImageKind::GIF(data)),
-        ImageFormat::WebP => Some(usvg::ImageKind::WEBP(data)),
-        _ => None,
+    let kind: fn(Arc<Vec<u8>>) -> usvg::ImageKind = match format {
+        ImageFormat::Jpeg => usvg::ImageKind::JPEG,
+        ImageFormat::Png => usvg::ImageKind::PNG,
+        ImageFormat::Gif => usvg::ImageKind::GIF,
+        ImageFormat::WebP => usvg::ImageKind::WEBP,
+        _ => return None,
+    };
+    // Headers only: no pixel is decoded. `no_limits` so these caps are the rule.
+    let mut reader = ImageReader::with_format(Cursor::new(data.as_slice()), format);
+    reader.no_limits();
+    let (width, height) = reader.into_dimensions().ok()?;
+    if width > MAX_RASTER_SIDE
+        || height > MAX_RASTER_SIDE
+        || u64::from(width) * u64::from(height) > MAX_RASTER_PIXELS
+    {
+        log::warn!("SVG raster of {width}x{height} refused");
+        return None;
     }
+    Some(kind(data))
 }
 
 fn rasterize_tree(tree: &usvg::Tree, size: SvgSize) -> Result<Pixmap, usvg::Error> {
@@ -511,6 +531,54 @@ mod tests {
                 renderer.render_pixmap(svg_with_image(&href).as_bytes(), SvgSize::Size(size))?;
             assert_eq!(pixmap.pixel(2, 2).map(|p| p.red()), Some(255), "{href}");
         }
+        Ok(())
+    }
+
+    /// A PNG of header chunks only (no pixel data) declaring `width` x
+    /// `height`, as a percent-encoded data URL.
+    fn png_header_data_url(width: u32, height: u32) -> String {
+        let chunk = |kind: &[u8], body: &[u8]| {
+            let mut crc = flate2::Crc::new();
+            crc.update(kind);
+            crc.update(body);
+            let len = (body.len() as u32).to_be_bytes();
+            [&len[..], kind, body, &crc.sum().to_be_bytes()].concat()
+        };
+        let ihdr = [
+            &width.to_be_bytes()[..],
+            &height.to_be_bytes(),
+            &[8, 6, 0, 0, 0],
+        ]
+        .concat();
+        let png = [
+            &b"\x89PNG\r\n\x1a\n"[..],
+            &chunk(b"IHDR", &ihdr),
+            &chunk(b"IDAT", &[]),
+            &chunk(b"IEND", &[]),
+        ]
+        .concat();
+        let body: String = png.iter().map(|byte| format!("%{byte:02X}")).collect();
+        format!("data:image/png,{body}")
+    }
+
+    #[test]
+    fn svg_raster_data_href_past_the_size_caps_is_refused() -> Result<()> {
+        let renderer = SvgRenderer::new(Arc::new(()));
+        let shown = |(width, height)| -> Result<bool> {
+            let href = png_header_data_url(width, height);
+            let svg = renderer.parse_svg(svg_with_image(&href).as_bytes())?;
+            Ok(find_image(svg.0.root()).is_some())
+        };
+        // At both caps: 8192 a side and 8192 * 2048 = MAX_RASTER_PIXELS.
+        assert!(shown((MAX_RASTER_SIDE, 2048))?);
+
+        let mut over = Vec::new();
+        for size in [(16383, 16383), (MAX_RASTER_SIDE + 1, 1), (4097, 4097)] {
+            if shown(size)? {
+                over.push(size);
+            }
+        }
+        assert_eq!(over, Vec::<(u32, u32)>::new());
         Ok(())
     }
 
