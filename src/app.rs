@@ -1151,6 +1151,19 @@ impl App {
         }
     }
 
+    /// The time from now to the next frame of the shared `fps` grid: the next
+    /// multiple of `1 / fps` (in whole nanoseconds) since the clock that
+    /// phase-locks synced animations, never now itself. Animations that wake
+    /// on it at the same `fps` share every frame, however far apart they
+    /// started.
+    ///
+    /// Panics if `fps` is zero, negative or NaN.
+    pub fn until_next_animation_frame(&self, fps: f32) -> Duration {
+        let period = Duration::from_secs_f64(1.0 / fps as f64).as_nanos().max(1);
+        let elapsed = (self.background_executor.now() - self.synced_animation_epoch).as_nanos();
+        Duration::from_nanos((period - elapsed % period) as u64)
+    }
+
     /// Schedules all windows in the application to be redrawn. This can be called
     /// multiple times in an update cycle and still result in a single redraw.
     pub fn refresh_windows(&mut self) {
