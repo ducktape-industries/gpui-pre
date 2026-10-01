@@ -339,6 +339,9 @@ version = "0.3.34"
 [dependencies.futures-concurrency]
 version = "7.7.1"
 
+[dependencies.gif]
+version = "0.14"
+
 [dependencies.gpui_macros]
 version = "=0.3.7"
 package = "gpui-pre-macros"

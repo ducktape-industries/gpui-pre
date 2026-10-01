@@ -303,12 +303,76 @@ const MAX_RASTER_SIDE: u32 = 8192;
 /// The most pixels an SVG data URL raster may declare: 64 MiB of RGBA.
 const MAX_RASTER_PIXELS: u64 = 1 << 24;
 
+fn raster_fits(width: u32, height: u32) -> bool {
+    width <= MAX_RASTER_SIDE
+        && height <= MAX_RASTER_SIDE
+        && u64::from(width) * u64::from(height) <= MAX_RASTER_PIXELS
+}
+
+/// Whether every `VP8 ` and `VP8L` frame of a WebP, at the top level and
+/// inside each `ANMF` frame, fits at its own declared size. image-webp decodes
+/// a frame whole before it compares the frame with the `VP8X` canvas, so the
+/// canvas size alone does not bound the decode. A chunk that does not read
+/// refuses the image.
+fn webp_frames_fit(data: &[u8]) -> bool {
+    let Some(riff_size) = data.get(4..8) else {
+        return false;
+    };
+    let riff_end = (u32::from_le_bytes(riff_size.try_into().unwrap()) as usize).saturating_add(8);
+    data.get(8..12) == Some(&b"WEBP"[..])
+        && data
+            .get(12..riff_end.min(data.len()))
+            .is_some_and(|chunks| webp_chunks_fit(chunks, true))
+}
+
+fn webp_chunks_fit(mut chunks: &[u8], top_level: bool) -> bool {
+    let side = |low: u8, high: u8| u32::from(u16::from_le_bytes([low, high]) & 0x3FFF);
+    while let Some(header) = chunks.get(..8) {
+        let size = u32::from_le_bytes(header[4..].try_into().unwrap()) as usize;
+        let rest = &chunks[8..];
+        let Some(body) = rest.get(..size) else {
+            return false;
+        };
+        let fits = match &header[..4] {
+            // The frame header's 14-bit width and height, after the start code.
+            b"VP8 " => body
+                .get(6..10)
+                .is_some_and(|d| raster_fits(side(d[0], d[1]), side(d[2], d[3]))),
+            // 14-bit width - 1 and height - 1, after the 0x2f signature.
+            b"VP8L" => body.get(1..5).is_some_and(|d| {
+                let bits = u32::from_le_bytes(d.try_into().unwrap());
+                raster_fits((bits & 0x3FFF) + 1, (bits >> 14 & 0x3FFF) + 1)
+            }),
+            // A 16-byte frame header, then the frame's own chunks. Frames do
+            // not nest, so neither does this walk.
+            b"ANMF" => top_level && body.get(16..).is_some_and(|f| webp_chunks_fit(f, false)),
+            _ => true,
+        };
+        if !fits {
+            return false;
+        }
+        chunks = rest.get(size + size % 2..).unwrap_or_default();
+    }
+    true
+}
+
+/// Whether a GIF's first frame fits: resvg decodes that frame at its own size,
+/// whatever the logical screen declares.
+fn gif_first_frame_fits(data: &[u8]) -> bool {
+    let Ok(mut decoder) = gif::DecodeOptions::new().read_info(data) else {
+        return false;
+    };
+    matches!(decoder.next_frame_info(), Ok(Some(frame))
+        if raster_fits(frame.width.into(), frame.height.into()))
+}
+
 /// An `<image>` or `<feImage>` data URL resolves to a raster image only, as
 /// usvg's default does for rasters. A nested SVG (`image/svg+xml`, or
 /// `text/plain` without raster magic) is refused: usvg would parse it, and
 /// inflate it without a bound when it is gzip. A raster whose header declares
 /// more than [`MAX_RASTER_SIDE`] a side or [`MAX_RASTER_PIXELS`] is refused
-/// too: resvg decodes it whole, and a small WebP or JPEG can declare 1 GiB.
+/// too, and so is a WebP or GIF frame that does: resvg decodes them whole, and
+/// a small WebP or JPEG can declare 1 GiB.
 fn raster_data_href(mime: &str, data: Arc<Vec<u8>>, _: &usvg::Options) -> Option<usvg::ImageKind> {
     let format = match mime {
         "image/jpg" | "image/jpeg" => ImageFormat::Jpeg,
@@ -329,11 +393,15 @@ fn raster_data_href(mime: &str, data: Arc<Vec<u8>>, _: &usvg::Options) -> Option
     let mut reader = ImageReader::with_format(Cursor::new(data.as_slice()), format);
     reader.no_limits();
     let (width, height) = reader.into_dimensions().ok()?;
-    if width > MAX_RASTER_SIDE
-        || height > MAX_RASTER_SIDE
-        || u64::from(width) * u64::from(height) > MAX_RASTER_PIXELS
-    {
-        log::warn!("SVG raster of {width}x{height} refused");
+    let frames_fit = match format {
+        ImageFormat::WebP => webp_frames_fit(&data),
+        ImageFormat::Gif => gif_first_frame_fits(&data),
+        _ => true,
+    };
+    if !raster_fits(width, height) || !frames_fit {
+        log::warn!(
+            "SVG raster of {width}x{height}, or a frame in it, is too large or unreadable; refused"
+        );
         return None;
     }
     Some(kind(data))
@@ -534,9 +602,21 @@ mod tests {
         Ok(())
     }
 
+    /// `bytes` as a percent-encoded data URL.
+    fn data_url(mime: &str, bytes: &[u8]) -> String {
+        let body: String = bytes.iter().map(|byte| format!("%{byte:02X}")).collect();
+        format!("data:{mime},{body}")
+    }
+
+    /// Whether an `<image>` with this href parses to an image node.
+    fn shown(renderer: &SvgRenderer, href: &str) -> Result<bool> {
+        let svg = renderer.parse_svg(svg_with_image(href).as_bytes())?;
+        Ok(find_image(svg.0.root()).is_some())
+    }
+
     /// A PNG of header chunks only (no pixel data) declaring `width` x
-    /// `height`, as a percent-encoded data URL.
-    fn png_header_data_url(width: u32, height: u32) -> String {
+    /// `height`.
+    fn png_header(width: u32, height: u32) -> Vec<u8> {
         let chunk = |kind: &[u8], body: &[u8]| {
             let mut crc = flate2::Crc::new();
             crc.update(kind);
@@ -550,35 +630,124 @@ mod tests {
             &[8, 6, 0, 0, 0],
         ]
         .concat();
-        let png = [
+        [
             &b"\x89PNG\r\n\x1a\n"[..],
             &chunk(b"IHDR", &ihdr),
             &chunk(b"IDAT", &[]),
             &chunk(b"IEND", &[]),
         ]
-        .concat();
-        let body: String = png.iter().map(|byte| format!("%{byte:02X}")).collect();
-        format!("data:image/png,{body}")
+        .concat()
     }
 
     #[test]
     fn svg_raster_data_href_past_the_size_caps_is_refused() -> Result<()> {
         let renderer = SvgRenderer::new(Arc::new(()));
-        let shown = |(width, height)| -> Result<bool> {
-            let href = png_header_data_url(width, height);
-            let svg = renderer.parse_svg(svg_with_image(&href).as_bytes())?;
-            Ok(find_image(svg.0.root()).is_some())
-        };
+        let png = |(width, height)| data_url("image/png", &png_header(width, height));
         // At both caps: 8192 a side and 8192 * 2048 = MAX_RASTER_PIXELS.
-        assert!(shown((MAX_RASTER_SIDE, 2048))?);
+        assert!(shown(&renderer, &png((MAX_RASTER_SIDE, 2048)))?);
 
         let mut over = Vec::new();
         for size in [(16383, 16383), (MAX_RASTER_SIDE + 1, 1), (4097, 4097)] {
-            if shown(size)? {
+            if shown(&renderer, &png(size))? {
                 over.push(size);
             }
         }
         assert_eq!(over, Vec::<(u32, u32)>::new());
+        Ok(())
+    }
+
+    fn riff_chunk(fourcc: &[u8], body: &[u8]) -> Vec<u8> {
+        let pad: &[u8] = if body.len() % 2 == 1 { &[0] } else { &[] };
+        [fourcc, &(body.len() as u32).to_le_bytes(), body, pad].concat()
+    }
+
+    /// A `VP8 ` key frame header (no pixel data) declaring `width` x `height`.
+    fn vp8(width: u16, height: u16) -> Vec<u8> {
+        let header = [0, 0, 0, 0x9d, 0x01, 0x2a];
+        let body = [&header[..], &width.to_le_bytes(), &height.to_le_bytes()].concat();
+        riff_chunk(b"VP8 ", &body)
+    }
+
+    /// A `VP8L` header (no pixel data) declaring `width` x `height`.
+    fn vp8l(width: u32, height: u32) -> Vec<u8> {
+        let bits = (width - 1) | (height - 1) << 14;
+        riff_chunk(b"VP8L", &[&[0x2f][..], &bits.to_le_bytes()].concat())
+    }
+
+    /// An extended WebP: a `VP8X` canvas of `canvas` x `canvas` around
+    /// `frame`, which an `ANIM` + `ANMF` pair wraps when `animated`.
+    fn webp(canvas: u32, animated: bool, frame: Vec<u8>) -> String {
+        let less_one = (canvas - 1).to_le_bytes();
+        let flags = if animated { 0x02 } else { 0 };
+        let vp8x = [&[flags, 0, 0, 0][..], &less_one[..3], &less_one[..3]].concat();
+        let mut chunks = riff_chunk(b"VP8X", &vp8x);
+        if animated {
+            chunks.extend(riff_chunk(b"ANIM", &[0; 6]));
+            let anmf = [&[0; 6][..], &less_one[..3], &less_one[..3], &[0; 4], &frame].concat();
+            chunks.extend(riff_chunk(b"ANMF", &anmf));
+        } else {
+            chunks.extend(frame);
+        }
+        let riff_size = (4 + chunks.len() as u32).to_le_bytes();
+        let file = [&b"RIFF"[..], &riff_size, b"WEBP", &chunks].concat();
+        data_url("image/webp", &file)
+    }
+
+    #[test]
+    fn svg_webp_frame_past_the_caps_is_refused_whatever_the_canvas() -> Result<()> {
+        let renderer = SvgRenderer::new(Arc::new(()));
+        // A real encoded WebP, and the same shapes at an honest small size,
+        // read and show.
+        let mut encoded = Cursor::new(Vec::new());
+        image::RgbaImage::from_pixel(4, 4, image::Rgba([255, 0, 0, 255]))
+            .write_to(&mut encoded, ImageFormat::WebP)?;
+        for href in [
+            data_url("image/webp", encoded.get_ref()),
+            webp(4, false, vp8(4, 4)),
+            webp(4, false, vp8l(4, 4)),
+            webp(4, true, vp8(4, 4)),
+        ] {
+            assert!(shown(&renderer, &href)?, "{href}");
+        }
+
+        let mut shown_over = Vec::new();
+        for (name, href) in [
+            ("VP8X 1x1 around VP8 8200", webp(1, false, vp8(8200, 8200))),
+            (
+                "VP8X 1x1 around VP8L 8200",
+                webp(1, false, vp8l(8200, 8200)),
+            ),
+            ("ANMF frame VP8 8200", webp(1, true, vp8(8200, 8200))),
+        ] {
+            if shown(&renderer, &href)? {
+                shown_over.push(name);
+            }
+        }
+        assert_eq!(shown_over, Vec::<&str>::new());
+        Ok(())
+    }
+
+    /// A GIF header (no pixel data): a `screen` x `screen` logical screen
+    /// with a two-color table, and a first frame of `width` x `height`.
+    fn gif_header(screen: u16, width: u16, height: u16) -> Vec<u8> {
+        [
+            &b"GIF89a"[..],
+            &screen.to_le_bytes(),
+            &screen.to_le_bytes(),
+            &[0x80, 0, 0, 0, 0, 0, 255, 255, 255, 0x2c, 0, 0, 0, 0],
+            &width.to_le_bytes(),
+            &height.to_le_bytes(),
+            &[0, 2, 0, 0x3b],
+        ]
+        .concat()
+    }
+
+    #[test]
+    fn svg_gif_first_frame_past_the_caps_is_refused_whatever_the_screen() -> Result<()> {
+        let renderer = SvgRenderer::new(Arc::new(()));
+        let gif = |screen, width, height| data_url("image/gif", &gif_header(screen, width, height));
+        assert!(shown(&renderer, &gif(4, 4, 4))?);
+        assert!(!shown(&renderer, &gif(1, 65535, 190))?);
         Ok(())
     }
 
