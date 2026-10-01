@@ -2,11 +2,12 @@ use crate::{
     AssetSource, DevicePixels, IsZero, RenderImage, Result, SharedString, Size,
     swap_rgba_pa_to_bgra,
 };
-use image::Frame;
+use image::{Frame, ImageFormat};
 use resvg::tiny_skia::Pixmap;
 use smallvec::SmallVec;
 use std::{
     hash::Hash,
+    io::Read,
     sync::{Arc, LazyLock, OnceLock},
 };
 
@@ -178,6 +179,12 @@ impl SvgRenderer {
                 select_font: font_resolver,
                 select_fallback: fallback_selection,
             },
+            image_href_resolver: usvg::ImageHrefResolver {
+                resolve_data: Box::new(raster_data_href),
+                // usvg's default reads any file an href names (`/dev/zero`, a
+                // FIFO, the person's own pictures). An href is never read.
+                resolve_string: Box::new(|_, _| None),
+            },
             ..Default::default()
         };
         Self {
@@ -188,7 +195,7 @@ impl SvgRenderer {
 
     /// Parses SVG data into a [`ParsedSvg`] that can be rasterized at any scale.
     pub fn parse_svg(&self, bytes: &[u8]) -> Result<ParsedSvg, usvg::Error> {
-        usvg::Tree::from_data(bytes, &self.usvg_options).map(ParsedSvg)
+        parse_tree(bytes, &self.usvg_options).map(ParsedSvg)
     }
 
     /// Rasterizes a previously parsed SVG into an image buffer.
@@ -262,8 +269,53 @@ impl SvgRenderer {
     }
 
     fn render_pixmap(&self, bytes: &[u8], size: SvgSize) -> Result<Pixmap, usvg::Error> {
-        let tree = usvg::Tree::from_data(bytes, &self.usvg_options)?;
+        let tree = parse_tree(bytes, &self.usvg_options)?;
         rasterize_tree(&tree, size)
+    }
+}
+
+/// How far a gzip-compressed (svgz) document may inflate. A plain SVG cannot
+/// amplify itself; a compressed one can, and usvg inflates it without a bound.
+/// 16 MiB is sixteen times the largest picture a ducktape view may send.
+const MAX_SVGZ_INFLATED_BYTES: u64 = 16 << 20;
+
+fn parse_tree(bytes: &[u8], options: &usvg::Options) -> Result<usvg::Tree, usvg::Error> {
+    if !bytes.starts_with(&[0x1f, 0x8b]) {
+        return usvg::Tree::from_data(bytes, options);
+    }
+    let mut inflated = Vec::new();
+    flate2::read::GzDecoder::new(bytes)
+        .take(MAX_SVGZ_INFLATED_BYTES + 1)
+        .read_to_end(&mut inflated)
+        .map_err(|_| usvg::Error::MalformedGZip)?;
+    if inflated.len() as u64 > MAX_SVGZ_INFLATED_BYTES {
+        log::warn!("svgz inflates past {MAX_SVGZ_INFLATED_BYTES} bytes; refused");
+        return Err(usvg::Error::MalformedGZip);
+    }
+    // `from_str`, not `from_data`: gzip inside gzip would inflate unbounded.
+    let text = std::str::from_utf8(&inflated).map_err(|_| usvg::Error::NotAnUtf8Str)?;
+    usvg::Tree::from_str(text, options)
+}
+
+/// An `<image>` or `<feImage>` data URL resolves to a raster image only, as
+/// usvg's default does for rasters. A nested SVG (`image/svg+xml`, or
+/// `text/plain` without raster magic) is refused: usvg would parse it, and
+/// inflate it without a bound when it is gzip.
+fn raster_data_href(mime: &str, data: Arc<Vec<u8>>, _: &usvg::Options) -> Option<usvg::ImageKind> {
+    let format = match mime {
+        "image/jpg" | "image/jpeg" => ImageFormat::Jpeg,
+        "image/png" => ImageFormat::Png,
+        "image/gif" => ImageFormat::Gif,
+        "image/webp" => ImageFormat::WebP,
+        "text/plain" => image::guess_format(&data).ok()?,
+        _ => return None,
+    };
+    match format {
+        ImageFormat::Jpeg => Some(usvg::ImageKind::JPEG(data)),
+        ImageFormat::Png => Some(usvg::ImageKind::PNG(data)),
+        ImageFormat::Gif => Some(usvg::ImageKind::GIF(data)),
+        ImageFormat::WebP => Some(usvg::ImageKind::WEBP(data)),
+        _ => None,
     }
 }
 
@@ -387,6 +439,101 @@ mod tests {
         )?;
 
         assert_eq!(image.size(0), Size::new(DevicePixels(24), DevicePixels(12)));
+        Ok(())
+    }
+
+    /// `<svg width="4" height="4"><rect width="4" height="4"/></svg>`, base64.
+    const SUB_SVG: &str = "PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI0IiBoZWlnaHQ9IjQiPjxyZWN0IHdpZHRoPSI0IiBoZWlnaHQ9IjQiLz48L3N2Zz4=";
+    /// [`SUB_SVG`] gzip-compressed, base64.
+    const SUB_SVGZ: &str = "H4sIAAAAAAACA7MpLktXqMjNySu2VcooKSmw0tcvLy/XKzfWyy9K1zcyMDDQB6pQUijPTCnJsFUyUVLISM1MzygBMe1silKTS7BK6dvZgPTZAQAT6jFqXwAAAA==";
+    /// A 1x1 opaque red PNG, base64.
+    const RED_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
+
+    fn find_image(group: &usvg::Group) -> Option<&usvg::Image> {
+        group.children().iter().find_map(|node| match node {
+            usvg::Node::Image(image) => Some(&**image),
+            usvg::Node::Group(group) => find_image(group),
+            _ => None,
+        })
+    }
+
+    fn svg_with_image(href: &str) -> String {
+        format!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="4" height="4"><image href="{href}" width="4" height="4"/></svg>"#
+        )
+    }
+
+    #[test]
+    fn svg_image_href_never_reads_a_local_file() -> Result<()> {
+        let path = std::env::temp_dir().join(format!("gpui-svg-href-{}.png", std::process::id()));
+        image::RgbaImage::from_pixel(4, 4, image::Rgba([255, 0, 0, 255])).save(&path)?;
+        let renderer = SvgRenderer::new(Arc::new(()));
+        let svg = renderer.parse_svg(svg_with_image(&path.to_string_lossy()).as_bytes());
+        std::fs::remove_file(&path)?;
+
+        assert!(find_image(svg?.0.root()).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn svg_nested_svg_data_href_is_refused() -> Result<()> {
+        let renderer = SvgRenderer::new(Arc::new(()));
+        let mut shown = Vec::new();
+        for href in [
+            format!("data:image/svg+xml;base64,{SUB_SVG}"),
+            format!("data:text/plain;base64,{SUB_SVG}"),
+            format!("data:image/svg+xml;base64,{SUB_SVGZ}"),
+        ] {
+            let svg = renderer.parse_svg(svg_with_image(&href).as_bytes())?;
+            if find_image(svg.0.root()).is_some() {
+                shown.push(href);
+            }
+        }
+        assert_eq!(shown, Vec::<String>::new());
+        Ok(())
+    }
+
+    #[test]
+    fn svg_raster_data_href_still_renders() -> Result<()> {
+        let renderer = SvgRenderer::new(Arc::new(()));
+        for href in [
+            format!("data:image/png;base64,{RED_PNG}"),
+            format!("data:;base64,{RED_PNG}"),
+        ] {
+            let svg = renderer.parse_svg(svg_with_image(&href).as_bytes())?;
+            let image = find_image(svg.0.root());
+            assert!(
+                matches!(image.map(|i| i.kind()), Some(usvg::ImageKind::PNG(_))),
+                "{href}"
+            );
+            let size = Size::new(DevicePixels(4), DevicePixels(4));
+            let pixmap =
+                renderer.render_pixmap(svg_with_image(&href).as_bytes(), SvgSize::Size(size))?;
+            assert_eq!(pixmap.pixel(2, 2).map(|p| p.red()), Some(255), "{href}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn svgz_inflating_past_the_cap_is_refused() -> Result<()> {
+        use std::io::Write;
+        let gzip = |svg: &[u8]| -> std::io::Result<Vec<u8>> {
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+            encoder.write_all(svg)?;
+            encoder.finish()
+        };
+        let renderer = SvgRenderer::new(Arc::new(()));
+        let open = br#"<svg xmlns="http://www.w3.org/2000/svg" width="4" height="4">"#;
+        let small = gzip(&[&open[..], b"</svg>"].concat())?;
+        assert!(renderer.parse_svg(&small).is_ok());
+
+        let padding = vec![b' '; MAX_SVGZ_INFLATED_BYTES as usize];
+        let bomb = gzip(&[&open[..], &padding, b"</svg>"].concat())?;
+        assert!(matches!(
+            renderer.parse_svg(&bomb),
+            Err(usvg::Error::MalformedGZip)
+        ));
         Ok(())
     }
 
