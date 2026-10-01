@@ -2331,20 +2331,21 @@ impl Window {
 
     /// A focus move redraws the views that rendered the old and the new focus
     /// ids (and their ancestors), not the whole window: `refresh` made every
-    /// cached view miss on the next draw. A view that reads a focus handle it
-    /// did not render must observe focus to see the move. Like `refresh`, this
-    /// is a no-op while a draw is in progress: `draw` schedules the frame for a
-    /// move made by its focus listeners.
+    /// cached view miss on the next draw. The views that rendered an `in_focus`
+    /// reader under either id redraw too: `within_focused` is read in the
+    /// reader's own prepaint, which a cached view replays. A view that reads a
+    /// focus handle it did not render must observe focus to see the move. Like
+    /// `refresh`, this is a no-op while a draw is in progress: `draw` schedules
+    /// the frame for a move made by its focus listeners.
     fn invalidate_focus_move(&mut self, previous: Option<FocusId>, next: Option<FocusId>) {
         if !self.invalidator.not_drawing() {
             return;
         }
         for focus_id in [previous, next].into_iter().flatten() {
-            if let Some(view_id) = self
-                .rendered_frame
-                .dispatch_tree
-                .view_of_focusable(focus_id)
-            {
+            let tree = &self.rendered_frame.dispatch_tree;
+            let mut views = tree.views_reading_focus_within(focus_id);
+            views.extend(tree.view_of_focusable(focus_id));
+            for view_id in views {
                 self.mark_view_dirty(view_id);
             }
         }
@@ -5206,6 +5207,13 @@ impl Window {
     pub fn set_view_id(&mut self, view_id: EntityId) {
         self.invalidator.debug_assert_prepaint();
         self.next_frame.dispatch_tree.set_view_id(view_id);
+    }
+
+    /// Notes that the current element styles itself by `in_focus`, so a focus
+    /// move onto or off one of its ancestors redraws the view that rendered it.
+    pub(crate) fn set_in_focus_reader(&mut self) {
+        self.invalidator.debug_assert_prepaint();
+        self.next_frame.dispatch_tree.set_in_focus_reader();
     }
 
     /// Get the entity ID for the currently rendering view
