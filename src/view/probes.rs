@@ -1,8 +1,9 @@
 //! The fork's view-cache semantics, pinned as numbers: which views render
 //! when a sibling, a child or a read model notifies, and (P7) that a cached
 //! view keeps its accessibility nodes, side entries, action listeners and
-//! focus while its prepaint is reused, and (P8) that a focus move re-renders
-//! the two views that own the old and the new focus, not the window.
+//! focus while its prepaint is reused, (P8) that a focus move re-renders
+//! the two views that own the old and the new focus, not the window, and
+//! (P9) the cached `in_focus` readers under either focus with them.
 //!
 //! P1-P6 came from the shell-rewrite design probes; a per-view render counter
 //! is the only instrument.
@@ -755,4 +756,109 @@ fn p8b_blur_and_a_listener_move_re_render_two_views(cx: &mut TestAppContext) {
     let blur = std::array::from_fn::<u32, 5, _>(|i| after_blur[i] - after_fwd[i]);
     assert_eq!(blur, [1, 0, 0, 1, 0], "blur: root and C only");
     assert_eq!(d(after_blur), [3, 0, 2, 2, 0], "totals since the start");
+}
+
+/// A cached view whose div styles itself by `in_focus`. Its render records
+/// what `within_focused` read, which is what that style follows.
+struct Within {
+    renders: Count,
+    handle: FocusHandle,
+    within: Rc<Cell<bool>>,
+}
+
+impl Render for Within {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.renders.set(self.renders.get() + 1);
+        self.within.set(self.handle.within_focused(window, cx));
+        div()
+            .size(px(20.))
+            .track_focus(&self.handle)
+            .in_focus(|s| s.opacity(0.5))
+    }
+}
+
+/// The window root: renders its own focusable live over two cached views.
+struct Over {
+    renders: Count,
+    own: FocusHandle,
+    stop: Entity<Stop>,
+    reader: Entity<Within>,
+}
+
+impl Render for Over {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        self.renders.set(self.renders.get() + 1);
+        let cached = |view: AnyView| view.cached(StyleRefinement::default().size(px(20.)));
+        div()
+            .size_full()
+            .track_focus(&self.own)
+            .child(cached(AnyView::from(self.stop.clone())))
+            .child(cached(AnyView::from(self.reader.clone())))
+    }
+}
+
+/// P9: a cached view whose div styles itself by `in_focus` under a focusable
+/// that an outer view renders live (the window root here; a cached owner
+/// re-renders its whole subtree, P5) redraws when that focusable gains or
+/// loses the focus, and its render sees the move. The first move does not
+/// touch the reader, so its flag must survive one reuse. The cached sibling
+/// with no such reader keeps its cache, so P8's two-view saving stands.
+#[gpui::test]
+fn p9_a_focus_move_re_renders_the_in_focus_readers_under_it(cx: &mut TestAppContext) {
+    let c: [Count; 3] = Default::default();
+    let k = c.clone();
+    let within = Rc::new(Cell::new(false));
+    let seen = within.clone();
+    let (root, mut native) = open(cx, move |cx| {
+        let stop_handle = cx.focus_handle();
+        let stop = cx.new(|_| Stop {
+            renders: k[1].clone(),
+            handle: stop_handle,
+            reads: None,
+        });
+        let reader_handle = cx.focus_handle();
+        let reader = cx.new(|_| Within {
+            renders: k[2].clone(),
+            handle: reader_handle,
+            within: seen,
+        });
+        Over {
+            renders: k[0].clone(),
+            own: cx.focus_handle(),
+            stop,
+            reader,
+        }
+    });
+    let (own, stop_handle) = root.read_with(&native, |root, cx| {
+        (root.own.clone(), root.stop.read(cx).handle.clone())
+    });
+    let start = counts(&c);
+    native.update(|window, cx| window.focus(&stop_handle, cx));
+    native.run_until_parked();
+    let after_stop = (counts(&c), within.get());
+    native.update(|window, cx| window.focus(&own, cx));
+    native.run_until_parked();
+    let after_own = (counts(&c), within.get());
+    native.update(|window, cx| window.focus(&stop_handle, cx));
+    native.run_until_parked();
+    let after_leave = (counts(&c), within.get());
+    eprintln!(
+        "P9 [root, stop, reader] (within): {start:?} -> focus(stop) {after_stop:?} -> focus(own) {after_own:?} -> focus(stop) {after_leave:?}"
+    );
+    assert_eq!(start, [1, 1, 1]);
+    assert_eq!(
+        after_stop,
+        ([2, 2, 1], false),
+        "focus(stop): the stop only; the reader is reused"
+    );
+    assert_eq!(
+        after_own,
+        ([3, 3, 2], true),
+        "focus(own): the stop it left, the root and the reader under it"
+    );
+    assert_eq!(
+        after_leave,
+        ([4, 4, 3], false),
+        "focus(stop): the stop, and the reader that left the focused subtree"
+    );
 }

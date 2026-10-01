@@ -2328,6 +2328,9 @@ impl Interactivity {
 
         if let Some(focus_handle) = self.tracked_focus_handle.as_ref() {
             window.set_focus_handle(focus_handle, cx);
+            if self.in_focus_style.is_some() {
+                window.set_in_focus_reader();
+            }
 
             if window.a11y.is_active() {
                 if let Some(global_id) = global_id {
