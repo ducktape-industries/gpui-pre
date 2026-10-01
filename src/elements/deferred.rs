@@ -20,8 +20,9 @@ pub struct Deferred {
 
 impl Deferred {
     /// Sets the `priority` value of the `deferred` element, which
-    /// determines the drawing order relative to other deferred elements,
-    /// with higher values being drawn on top.
+    /// determines the drawing order relative to the other deferred elements
+    /// made in the same deferred draw (or at the root), with higher values
+    /// being drawn on top. See [`Window::defer_draw`].
     pub fn with_priority(mut self, priority: usize) -> Self {
         self.priority = priority;
         self
@@ -88,7 +89,8 @@ impl IntoElement for Deferred {
 
 impl Deferred {
     /// Sets a priority for the element. A higher priority conceptually means painting the element
-    /// on top of deferred draws with a lower priority (i.e. closer to the viewer).
+    /// on top of sibling deferred draws (made in the same deferred draw) with a lower priority
+    /// (i.e. closer to the viewer).
     pub fn priority(mut self, priority: usize) -> Self {
         self.priority = priority;
         self
