@@ -6892,8 +6892,9 @@ impl Window {
     }
 
     /// Performs an accessibility action as if an adapter had requested it:
-    /// the node's own listener if it has one, else GPUI's built-in handling
-    /// (Click synthesized at the node's centre, Focus, Blur).
+    /// the node's own listener if it has one (a div's click listeners answer
+    /// its Click), else GPUI's built-in handling (Click synthesized at the
+    /// node's centre, Focus, Blur).
     #[cfg(not(target_family = "wasm"))]
     pub fn dispatch_a11y_action(&mut self, request: accesskit::ActionRequest, cx: &mut App) {
         self.handle_a11y_action(request, cx);

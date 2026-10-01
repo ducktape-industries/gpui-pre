@@ -9,7 +9,7 @@
 //! is the only instrument.
 
 use crate::{
-    AnyView, App, AppContext as _, Context, Entity, FocusHandle, IntoElement, Render,
+    AnyView, App, AppContext as _, Context, Entity, FocusHandle, IntoElement, MouseButton, Render,
     StyleRefinement, Subscription, TestAppContext, VisualTestContext, Window, anchored, deferred,
     div, prelude::*, px, size,
 };
@@ -345,8 +345,9 @@ struct Card {
     renders: Count,
     btn: FocusHandle,
     clicks: Count,
-    /// Mouse clicks on the card itself (no a11y listener: a Click action on
-    /// its node falls back to a synthesized click at its bounds' centre).
+    /// Mouse presses released on the card itself (no click or a11y listener:
+    /// a Click action on its node falls back to a synthesized press at its
+    /// bounds' centre).
     card_clicks: Count,
     deferred: bool,
 }
@@ -366,7 +367,9 @@ impl Render for Card {
             .id("card")
             .role(Role::Group)
             .size(px(40.))
-            .on_click(move |_, _, _| card_clicks.set(card_clicks.get() + 1));
+            .on_mouse_up(MouseButton::Left, move |_, _, _| {
+                card_clicks.set(card_clicks.get() + 1)
+            });
         match self.deferred {
             true => card.child(deferred(anchored().child(btn))),
             false => card.child(btn),
@@ -860,5 +863,137 @@ fn p9_a_focus_move_re_renders_the_in_focus_readers_under_it(cx: &mut TestAppCont
         after_leave,
         ([4, 4, 3], false),
         "focus(stop): the stop, and the reader that left the focused subtree"
+    );
+}
+
+/// A list clipped to 40 px whose row lies 100 px down, out of view, and a
+/// button under an occluding cover, and a link that answers Click itself;
+/// every element counts its clicks (the link its answers too) and the window
+/// root counts every pointer press it is hit by.
+struct Pressables {
+    row: Count,
+    button: Count,
+    cover: Count,
+    presses: Count,
+    link: Count,
+    link_answers: Count,
+}
+
+/// A listener that counts its calls on `count`.
+fn counted<E>(count: &Count) -> impl Fn(&E, &mut Window, &mut App) + 'static {
+    let count = count.clone();
+    move |_, _, _| count.set(count.get() + 1)
+}
+
+impl Render for Pressables {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id("root")
+            .size_full()
+            .flex()
+            .flex_col()
+            .on_mouse_down(MouseButton::Left, counted(&self.presses))
+            .child(
+                div()
+                    .id("list")
+                    .size(px(40.))
+                    .flex_shrink_0()
+                    .flex()
+                    .flex_col()
+                    .overflow_hidden()
+                    .child(div().h(px(100.)).flex_shrink_0())
+                    .child(
+                        div()
+                            .id("row")
+                            .role(Role::ListBoxOption)
+                            .size(px(20.))
+                            .flex_shrink_0()
+                            .on_click(counted(&self.row)),
+                    ),
+            )
+            .child(
+                div()
+                    .relative()
+                    .size(px(40.))
+                    .flex_shrink_0()
+                    .child(
+                        div()
+                            .id("button")
+                            .role(Role::Button)
+                            .size(px(40.))
+                            .on_click(counted(&self.button)),
+                    )
+                    .child(
+                        div()
+                            .id("cover")
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .size(px(40.))
+                            .occlude()
+                            .on_click(counted(&self.cover)),
+                    ),
+            )
+            .child({
+                let answers = self.link_answers.clone();
+                div()
+                    .id("link")
+                    .role(Role::Link)
+                    .size(px(20.))
+                    .flex_shrink_0()
+                    .on_click(counted(&self.link))
+                    .on_a11y_action(Action::Click, move |_, _, _| answers.set(answers.get() + 1))
+            })
+    }
+}
+
+/// A Click from assistive technology on an element with a click listener runs
+/// that listener, whether the element is clipped out of its list or covered by
+/// another, and no pointer press is synthesized at its centre: the row's and
+/// the button's own clicks fire, the cover's and the root's presses do not.
+/// An element that answers Click itself keeps its answer, and only it runs.
+#[gpui::test]
+fn a11y_click_runs_the_click_listener_of_a_clipped_or_covered_element(cx: &mut TestAppContext) {
+    let c: [Count; 6] = Default::default();
+    let k = c.clone();
+    let (_, mut native) = open(cx, move |_| Pressables {
+        row: k[0].clone(),
+        button: k[1].clone(),
+        cover: k[2].clone(),
+        presses: k[3].clone(),
+        link: k[4].clone(),
+        link_answers: k[5].clone(),
+    });
+    native.update(|window, _| window.activate_a11y());
+    native.run_until_parked();
+    let first = tree(&mut native);
+    let row = node_with_role(&first, Role::ListBoxOption);
+    let button = node_with_role(&first, Role::Button);
+    let link = node_with_role(&first, Role::Link);
+    assert!(
+        first
+            .nodes
+            .iter()
+            .any(|(id, n)| *id == row && n.supports_action(Action::Click))
+    );
+
+    native.update(|window, cx| window.dispatch_a11y_action(request(Action::Click, row), cx));
+    // [row, button, cover, presses, link, link answers]
+    assert_eq!(
+        counts(&c),
+        [1, 0, 0, 0, 0, 0],
+        "the clipped row's own click"
+    );
+    native.update(|window, cx| window.dispatch_a11y_action(request(Action::Click, button), cx));
+    assert_eq!(
+        counts(&c),
+        [1, 1, 0, 0, 0, 0],
+        "the covered button's own click"
+    );
+    native.update(|window, cx| window.dispatch_a11y_action(request(Action::Click, link), cx));
+    assert_eq!(
+        counts(&c),
+        [1, 1, 0, 0, 0, 1],
+        "the link's own answer, alone"
     );
 }
