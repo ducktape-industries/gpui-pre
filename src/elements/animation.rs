@@ -63,9 +63,10 @@ impl Animation {
     }
 
     /// Limit how often this animation re-renders. Instead of re-rendering on
-    /// every frame, the animation schedules its next render `1 / max_fps`
-    /// seconds after the current one. Values that are not finite and positive
-    /// are ignored.
+    /// every frame, the animation schedules its next render on the next frame
+    /// of the shared `max_fps` grid ([`App::until_next_animation_frame`]), so
+    /// animations at one rate share their frames. Values that are not finite
+    /// and positive are ignored.
     pub fn with_max_fps(mut self, max_fps: f32) -> Self {
         self.max_fps = Some(max_fps);
         self
@@ -455,7 +456,7 @@ impl<E: IntoElement + 'static> Element for AnimationElement<E> {
                             state.delayed_frame_pending.set(true);
                             let delayed_frame_pending = state.delayed_frame_pending.clone();
                             let view = window.current_view();
-                            let interval = Duration::from_secs_f32(1.0 / max_fps);
+                            let interval = cx.until_next_animation_frame(max_fps);
                             window
                                 .spawn(cx, async move |cx| {
                                     cx.background_executor().timer(interval).await;
@@ -577,6 +578,11 @@ mod tests {
         second_deltas: Rc<RefCell<Vec<f32>>>,
     }
 
+    struct ThrottledPairTestView {
+        show_second: bool,
+        render_times: Rc<RefCell<Vec<Instant>>>,
+    }
+
     struct SpringAnimationTestView {
         target: Pixels,
         initial: Option<Pixels>,
@@ -622,6 +628,27 @@ mod tests {
                         Animation::new(Duration::from_secs(1)).repeat_synced(),
                         record_deltas(self.second_deltas.clone()),
                     ))
+                })
+        }
+    }
+
+    impl Render for ThrottledPairTestView {
+        fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            self.render_times
+                .borrow_mut()
+                .push(cx.background_executor().now());
+            let animation = || {
+                Animation::new(Duration::from_secs(1))
+                    .repeat_synced()
+                    .with_max_fps(30.)
+            };
+            div()
+                .size_full()
+                .child(div().with_animation("first-throttled", animation(), |this, _| this))
+                .when(self.show_second, |this| {
+                    this.child(
+                        div().with_animation("second-throttled", animation(), |this, _| this),
+                    )
                 })
         }
     }
@@ -960,6 +987,39 @@ mod tests {
         cx.executor().advance_clock(Duration::from_millis(105));
         cx.run_until_parked();
         assert_deltas_approx_eq(&[0.0, 0.105, 0.21]);
+    }
+
+    #[gpui::test]
+    fn test_max_fps_animations_started_apart_share_frames(cx: &mut TestAppContext) {
+        let render_times = Rc::new(RefCell::new(Vec::new()));
+        let window = cx.open_window(size(px(100.), px(100.)), {
+            let render_times = render_times.clone();
+            move |_, _| ThrottledPairTestView {
+                show_second: false,
+                render_times,
+            }
+        });
+        cx.run_until_parked();
+
+        // The second animation mounts 10 ms in, between two 30 fps frames.
+        cx.executor().advance_clock(Duration::from_millis(10));
+        window
+            .update(cx, |view, _, cx| {
+                view.show_second = true;
+                cx.notify();
+            })
+            .unwrap();
+        cx.run_until_parked();
+        render_times.borrow_mut().clear();
+
+        // The test window draws on every notify, so two notifies at one
+        // instant draw twice here; a platform window draws once per frame it
+        // schedules, so notifies before that frame are one draw. Count the
+        // instants that drew.
+        cx.executor().advance_clock(Duration::from_secs(1));
+        let mut frames = render_times.borrow().clone();
+        frames.dedup();
+        assert_eq!(frames.len(), 30, "frames: {frames:?}");
     }
 
     #[gpui::test]
