@@ -5913,6 +5913,119 @@ mod tests {
         }
     }
 
+    /// A 20px tooltip source with a 60px tooltip, as a cached view counting its renders.
+    struct TipSource {
+        log: ClickLog,
+        renders: usize,
+    }
+
+    impl Render for TipSource {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            self.renders += 1;
+            div().size(px(20.)).child(click_tip_source(
+                "source",
+                size(px(60.), px(60.)),
+                false,
+                &self.log,
+            ))
+        }
+    }
+
+    struct TipUnderSiblingView {
+        source: Entity<TipSource>,
+        dialog_first: bool,
+        log: ClickLog,
+    }
+
+    impl Render for TipUnderSiblingView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let pane = crate::deferred(LayerBox {
+                priority: 16,
+                child: div()
+                    .size(px(200.))
+                    .child(
+                        self.source
+                            .clone()
+                            .cached(StyleRefinement::default().size(px(20.))),
+                    )
+                    .into_any_element(),
+            });
+            let log = self.log.clone();
+            let dialog = crate::deferred(
+                div()
+                    .id("dialog")
+                    .absolute()
+                    .left(px(30.))
+                    .top(px(30.))
+                    .size(px(100.))
+                    .bg(crate::rgb(DIALOG_COLOR))
+                    .occlude()
+                    .on_click(move |_, _, _| log.borrow_mut().push("dialog")),
+            )
+            .with_priority(1);
+            let root = div().size_full();
+            if self.dialog_first {
+                root.child(dialog).child(pane)
+            } else {
+                root.child(pane).child(dialog)
+            }
+        }
+    }
+
+    /// A layered tooltip draws inside the deferred draw its source was drawn in, at its layer's
+    /// priority among that draw's own: its source in a pane drawn at 0, a tooltip in a layer at
+    /// 16 paints and takes clicks under a dialog drawn at 1. It stays there when its source's
+    /// view is replayed from the cache while the pane and the dialog swap their registration
+    /// order.
+    #[gpui::test]
+    fn a_layered_tooltip_stays_under_its_source_draws_higher_sibling(cx: &mut TestAppContext) {
+        let log = ClickLog::default();
+        let (view, cx) = cx.add_window_view({
+            let log = log.clone();
+            move |_, cx| TipUnderSiblingView {
+                source: cx.new(|_| TipSource {
+                    log: log.clone(),
+                    renders: 0,
+                }),
+                dialog_first: false,
+                log,
+            }
+        });
+        cx.run_until_parked();
+        show_tooltip(cx, point(px(10.), px(10.)));
+        let tip = quad_of(cx, TIP_COLOR).expect("the tooltip shows");
+        let dialog = quad_of(cx, DIALOG_COLOR).expect("the dialog paints");
+        assert!(
+            tip.order < dialog.order,
+            "the tooltip {} over the dialog {}",
+            tip.order,
+            dialog.order
+        );
+        let renders = |cx: &mut crate::VisualTestContext| {
+            view.read_with(cx, |view, cx| view.source.read(cx).renders)
+        };
+        let before = renders(cx);
+
+        view.update(cx, |view, cx| {
+            view.dialog_first = true;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert_eq!(renders(cx), before, "the source is replayed from its cache");
+        let tip = quad_of(cx, TIP_COLOR).expect("the tooltip still shows");
+        let dialog = quad_of(cx, DIALOG_COLOR).expect("the dialog still paints");
+        assert!(
+            tip.order < dialog.order,
+            "replayed: the tooltip {} over the dialog {}",
+            tip.order,
+            dialog.order
+        );
+
+        cx.simulate_click(point(px(50.), px(50.)), crate::Modifiers::none());
+        assert_eq!(*log.borrow(), ["dialog"]);
+    }
+
     struct TooltipNearPaneEdgeView {
         layer: Option<usize>,
         log: ClickLog,
