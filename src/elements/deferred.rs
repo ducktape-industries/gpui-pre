@@ -98,9 +98,11 @@ impl Deferred {
 #[cfg(test)]
 mod tests {
     use crate::{
-        Context, Entity, StyleRefinement, TestAppContext, Window, anchored, deferred, div, point,
-        prelude::*, px, size,
+        AnyElement, App, Bounds, Context, Div, Element, ElementId, Entity, GlobalElementId,
+        InspectorElementId, LayoutId, Modifiers, Pixels, Stateful, StyleRefinement, TestAppContext,
+        Window, anchored, deferred, div, point, prelude::*, px, size,
     };
+    use std::{cell::RefCell, rc::Rc};
 
     /// A stand-in for a dock panel hosting a popover (deferred draw) whose
     /// content opens another popover (a deferred draw created while
@@ -202,5 +204,146 @@ mod tests {
                 );
             })
             .unwrap();
+    }
+
+    type ClickLog = Rc<RefCell<Vec<&'static str>>>;
+
+    /// An occluding box that logs its clicks under `name`.
+    fn clicker(name: &'static str, log: &ClickLog) -> Stateful<Div> {
+        let log = log.clone();
+        div()
+            .id(name)
+            .absolute()
+            .size(px(100.))
+            .occlude()
+            .on_click(move |_, _, _| log.borrow_mut().push(name))
+    }
+
+    /// Defers its child with the content mask it is prepainted under, as a host defers a view's
+    /// overlay within the view's slot.
+    struct MaskedDeferred(Option<AnyElement>);
+
+    impl IntoElement for MaskedDeferred {
+        type Element = Self;
+
+        fn into_element(self) -> Self {
+            self
+        }
+    }
+
+    impl Element for MaskedDeferred {
+        type RequestLayoutState = ();
+        type PrepaintState = ();
+
+        fn id(&self) -> Option<ElementId> {
+            None
+        }
+
+        fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+            None
+        }
+
+        fn request_layout(
+            &mut self,
+            _: Option<&GlobalElementId>,
+            _: Option<&InspectorElementId>,
+            window: &mut Window,
+            cx: &mut App,
+        ) -> (LayoutId, ()) {
+            (self.0.as_mut().unwrap().request_layout(window, cx), ())
+        }
+
+        fn prepaint(
+            &mut self,
+            _: Option<&GlobalElementId>,
+            _: Option<&InspectorElementId>,
+            _: Bounds<Pixels>,
+            _: &mut (),
+            window: &mut Window,
+            _: &mut App,
+        ) {
+            let child = self.0.take().unwrap();
+            let mask = window.content_mask();
+            window.defer_draw(child, window.element_offset(), 0, Some(mask));
+        }
+
+        fn paint(
+            &mut self,
+            _: Option<&GlobalElementId>,
+            _: Option<&InspectorElementId>,
+            _: Bounds<Pixels>,
+            _: &mut (),
+            _: &mut (),
+            _: &mut Window,
+            _: &mut App,
+        ) {
+        }
+    }
+
+    struct SlotView(ClickLog);
+
+    impl Render for SlotView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size(px(40.))
+                .overflow_hidden()
+                .child(MaskedDeferred(Some(
+                    clicker("slot overlay", &self.0)
+                        .left(px(30.))
+                        .into_any_element(),
+                )))
+        }
+    }
+
+    /// A deferred draw given a content mask takes clicks only inside it, as it paints only
+    /// inside it: an overlay that spills out of its 40px slot takes no click at x = 100.
+    #[gpui::test]
+    fn a_masked_deferred_draw_takes_no_click_outside_its_mask(cx: &mut TestAppContext) {
+        let log = ClickLog::default();
+        let (_, cx) = cx.add_window_view({
+            let log = log.clone();
+            move |_, _| SlotView(log)
+        });
+        cx.run_until_parked();
+
+        cx.simulate_click(point(px(100.), px(10.)), Modifiers::none());
+        assert!(
+            log.borrow().is_empty(),
+            "a click outside the mask reached the draw: {:?}",
+            log.borrow()
+        );
+
+        cx.simulate_click(point(px(35.), px(10.)), Modifiers::none());
+        assert_eq!(*log.borrow(), ["slot overlay"]);
+    }
+
+    struct RoundsView(ClickLog);
+
+    impl Render for RoundsView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .child(
+                    deferred(div().child(deferred(clicker("round two at 0", &self.0))))
+                        .with_priority(1),
+                )
+                .child(deferred(clicker("round one at 5", &self.0)).with_priority(5))
+        }
+    }
+
+    /// Clicks reach deferred draws in paint order: by priority across every round. A draw
+    /// registered while another deferred draw prepaints (round two) at priority 0 paints under
+    /// a round-one draw at priority 5, so the click on the spot they share goes to the latter.
+    #[gpui::test]
+    fn a_later_rounds_lower_priority_draw_takes_no_click_from_above_it(cx: &mut TestAppContext) {
+        let log = ClickLog::default();
+        let (_, cx) = cx.add_window_view({
+            let log = log.clone();
+            move |_, _| RoundsView(log)
+        });
+        cx.run_until_parked();
+
+        cx.simulate_click(point(px(50.), px(50.)), Modifiers::none());
+        assert_eq!(*log.borrow(), ["round one at 5"]);
     }
 }
