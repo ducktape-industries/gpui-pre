@@ -1,7 +1,8 @@
 //! The fork's view-cache semantics, pinned as numbers: which views render
 //! when a sibling, a child or a read model notifies, and (P7) that a cached
 //! view keeps its accessibility nodes, side entries, action listeners and
-//! focus while its prepaint is reused.
+//! focus while its prepaint is reused, and (P8) that a focus move re-renders
+//! the two views that own the old and the new focus, not the window.
 //!
 //! P1-P6 came from the shell-rewrite design probes; a per-view render counter
 //! is the only instrument.
@@ -600,11 +601,16 @@ fn p7c_a_claim_under_an_outer_focus_survives_reuse(cx: &mut TestAppContext) {
     native.update(|window, _| window.activate_a11y());
     native.run_until_parked();
     let list = root.read_with(&native, |r, _| r.list.clone());
+    let pre = rows.get();
     native.update(|window, cx| window.focus(&list, cx));
     native.run_until_parked();
+    assert_eq!(rows.get(), pre, "the focus frame reused the row");
     let fresh = tree(&mut native);
     let row = node_with_role(&fresh, Role::ListBoxOption);
-    assert_eq!(fresh.focus, row, "fresh frame: the claim wins");
+    assert_eq!(
+        fresh.focus, row,
+        "focus frame: the replayed claim is judged by this frame's focus"
+    );
     let before = rows.get();
     let dot = root.read_with(&native, |r, _| r.dot.clone());
     dot.update(&mut native, |_, cx| cx.notify());
@@ -612,4 +618,141 @@ fn p7c_a_claim_under_an_outer_focus_survives_reuse(cx: &mut TestAppContext) {
     assert_eq!(rows.get(), before, "the row was reused");
     let reused = tree(&mut native);
     assert_eq!(reused.focus, row, "reused frame: the claim wins");
+}
+
+/// A cached view that owns a focus handle, or reads another view's.
+struct Stop {
+    renders: Count,
+    handle: FocusHandle,
+    /// The `is_focused` read of a handle this view did not render (P8's stale reader).
+    reads: Option<FocusHandle>,
+}
+
+impl Render for Stop {
+    fn render(&mut self, window: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        self.renders.set(self.renders.get() + 1);
+        let read = self.reads.as_ref().map(|h| h.is_focused(window));
+        div()
+            .size(px(20.))
+            .track_focus(&self.handle)
+            .child(format!("{:?} {read:?}", self.handle.is_focused(window)))
+    }
+}
+
+struct Stops {
+    renders: Count,
+    stops: Vec<Entity<Stop>>,
+}
+
+impl Render for Stops {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        self.renders.set(self.renders.get() + 1);
+        div().size_full().children(self.stops.iter().map(|stop| {
+            AnyView::from(stop.clone()).cached(StyleRefinement::default().size(px(20.)))
+        }))
+    }
+}
+
+/// P8 (F3): a focus move re-renders the views that rendered the old and the
+/// new focus ids, and the root over them; a cached sibling holding neither
+/// hits. A fourth cached view that reads C's handle without observing focus
+/// keeps its stale text (the s18 audit's class).
+#[gpui::test]
+fn p8_a_focus_move_re_renders_the_two_views_that_own_it(cx: &mut TestAppContext) {
+    let c: [Count; 5] = Default::default();
+    let k = c.clone();
+    let (root, mut native) = open(cx, move |cx| {
+        let stop = |i: usize, reads: Option<FocusHandle>, cx: &mut App| {
+            let handle = cx.focus_handle();
+            cx.new(|_| Stop {
+                renders: k[i].clone(),
+                handle,
+                reads,
+            })
+        };
+        let a = stop(1, None, cx);
+        let b = stop(2, None, cx);
+        let c = stop(3, None, cx);
+        let c_handle = c.read(cx).handle.clone();
+        let d = stop(4, Some(c_handle), cx);
+        Stops {
+            renders: k[0].clone(),
+            stops: vec![a, b, c, d],
+        }
+    });
+    let stops = root.read_with(&native, |root, _| root.stops.clone());
+    let handle =
+        |i: usize, native: &VisualTestContext| stops[i].read_with(native, |s, _| s.handle.clone());
+    let (b_handle, c_handle) = (handle(1, &native), handle(2, &native));
+    let before = counts(&c);
+    native.update(|window, cx| window.focus(&b_handle, cx));
+    native.run_until_parked();
+    let after_b = counts(&c);
+    native.update(|window, cx| window.focus(&c_handle, cx));
+    native.run_until_parked();
+    let after_c = counts(&c);
+    eprintln!(
+        "P8 [root, A, B, C, D reads C]: {before:?} -> focus(B) {after_b:?} -> focus(C) {after_c:?}"
+    );
+    assert_eq!(before, [1, 1, 1, 1, 1]);
+    assert_eq!(after_b, [2, 1, 2, 1, 1]);
+    assert_eq!(after_c, [3, 1, 3, 2, 1]);
+    assert!(native.update(|window, _| c_handle.is_focused(window)));
+}
+
+// P8b: `blur` and a focus move made by a focus listener during a draw take the
+// same two-view path. B's listener forwards focus to C; then the window blurs.
+#[gpui::test]
+fn p8b_blur_and_a_listener_move_re_render_two_views(cx: &mut TestAppContext) {
+    let c: [Count; 5] = Default::default();
+    let k = c.clone();
+    let (root, mut native) = open(cx, move |cx| {
+        let stop = |i: usize, cx: &mut App| {
+            let handle = cx.focus_handle();
+            cx.new(|_| Stop {
+                renders: k[i].clone(),
+                handle,
+                reads: None,
+            })
+        };
+        Stops {
+            renders: k[0].clone(),
+            stops: vec![stop(1, cx), stop(2, cx), stop(3, cx), stop(4, cx)],
+        }
+    });
+    native.update(|window, _| window.activate_window());
+    native.run_until_parked();
+    let base = counts(&c);
+    let stops = root.read_with(&native, |root, _| root.stops.clone());
+    let handle =
+        |i: usize, native: &VisualTestContext| stops[i].read_with(native, |s, _| s.handle.clone());
+    let (b_handle, c_handle) = (handle(1, &native), handle(2, &native));
+    let b = stops[1].clone();
+    let fwd = c_handle.clone();
+    let _sub = native.update(|window, cx| {
+        b.update(cx, |_, cx| {
+            cx.on_focus(&b_handle, window, move |_, window, cx| {
+                window.focus(&fwd, cx)
+            })
+        })
+    });
+    native.update(|window, cx| window.focus(&b_handle, cx));
+    native.run_until_parked();
+    // The test platform draws on a flush; the draw-end move left the window dirty.
+    native.update(|_, _| ());
+    let after_fwd = counts(&c);
+    assert!(native.update(|window, _| c_handle.is_focused(window)));
+    native.update(|window, cx| window.blur(cx));
+    native.run_until_parked();
+    let after_blur = counts(&c);
+    eprintln!("P8b {base:?} -> fwd {after_fwd:?} -> blur {after_blur:?}");
+    let d = |a: [u32; 5]| std::array::from_fn::<u32, 5, _>(|i| a[i] - base[i]);
+    assert_eq!(
+        d(after_fwd),
+        [2, 0, 2, 1, 0],
+        "listener move: B and C, not A or D"
+    );
+    let blur = std::array::from_fn::<u32, 5, _>(|i| after_blur[i] - after_fwd[i]);
+    assert_eq!(blur, [1, 0, 0, 1, 0], "blur: root and C only");
+    assert_eq!(d(after_blur), [3, 0, 2, 2, 0], "totals since the start");
 }

@@ -137,7 +137,8 @@ pub(crate) struct RenderedA11y {
     element_ids: FxHashMap<NodeId, GlobalElementId>,
     action_listeners: FxHashMap<NodeId, Vec<(Action, A11yActionListener)>>,
     focus: Option<NodeId>,
-    active_descendant: Option<NodeId>,
+    /// Every active-descendant claim made, as [`A11y::claims`].
+    claims: Vec<(NodeId, Option<NodeId>)>,
     /// The previous draw ran `begin_frame` and `end_frame`, so `log` is the
     /// tree the prepaint ranges of that frame index into.
     pub(crate) built: bool,
@@ -179,6 +180,11 @@ pub(crate) struct A11y {
     /// already had the same id, in paint order.
     refused: Vec<(NodeId, GlobalElementId)>,
     pub(crate) action_listeners: FxHashMap<NodeId, Vec<(Action, A11yActionListener)>>,
+    /// Every active-descendant claim made this frame, honored or not, with
+    /// its gate: the claimant's nearest focusable ancestor, whose focus
+    /// decides the claim. A reused range judges its claims again by the
+    /// current frame's focus (see [`Self::reuse_range`]).
+    claims: Vec<(NodeId, Option<NodeId>)>,
     pub(crate) rendered: RenderedA11y,
     /// The window's title, used to label the root node so assistive
     /// technology can tell windows apart.
@@ -210,6 +216,7 @@ impl A11y {
             element_ids: FxHashMap::default(),
             refused: Vec::new(),
             action_listeners: FxHashMap::default(),
+            claims: Vec::new(),
             rendered: RenderedA11y::default(),
             window_title,
             last_focus_without_node: None,
@@ -305,12 +312,12 @@ impl A11y {
             }
             return;
         }
-        if self.nodes.has_node(node_id)
-            && self
-                .nodes
-                .nearest_focusable_ancestor_is_focused(&self.focus_ids)
-        {
-            self.nodes.set_active_descendant(node_id);
+        if self.nodes.has_node(node_id) {
+            let gate = self.nodes.nearest_focusable_ancestor(&self.focus_ids);
+            self.claims.push((node_id, gate));
+            if gate.is_some() && gate == self.nodes.focus {
+                self.nodes.set_active_descendant(node_id);
+            }
         }
     }
 
@@ -347,7 +354,7 @@ impl A11y {
         self.rendered.action_listeners = mem::take(&mut self.action_listeners);
         self.rendered.log = mem::take(&mut self.nodes.log);
         self.rendered.focus = self.nodes.focus;
-        self.rendered.active_descendant = self.nodes.active_descendant;
+        self.rendered.claims = mem::take(&mut self.claims);
         self.refused.clear();
         self.nodes.begin_frame(self.window_title.as_ref());
     }
@@ -428,17 +435,17 @@ impl A11y {
         if contains_focus && let Some(focus) = self.rendered.focus.filter(|f| pushed.contains(f)) {
             self.nodes.focus = Some(focus);
         }
-        // A claim valid last frame whose focused node is set again this frame
-        // (in the range, or an ancestor already pushed live) is what a live
-        // build would accept.
-        if self.nodes.focus.is_some()
-            && self.nodes.focus == self.rendered.focus
-            && let Some(claim) = self
-                .rendered
-                .active_descendant
-                .filter(|c| pushed.contains(c))
-        {
-            self.nodes.active_descendant = Some(claim);
+        // A replayed claim is judged as a live build would judge it, by this
+        // frame's focus: it counts when its gate is the focused node (set in
+        // the range above, or by an ancestor already pushed live). The gate
+        // can have gained or lost the focus since the range was built.
+        for (claim, gate) in &self.rendered.claims {
+            if pushed.contains(claim) {
+                self.claims.push((*claim, *gate));
+                if gate.is_some() && *gate == self.nodes.focus {
+                    self.nodes.set_active_descendant(*claim);
+                }
+            }
         }
     }
 
@@ -686,15 +693,16 @@ impl A11yNodeBuilder {
         self.focus == Some(id)
     }
 
-    /// Whether the current node's nearest focusable ancestor (the first node
-    /// below it on the stack that is in `focus_ids`) is the focused node.
+    /// The current node's nearest focusable ancestor: the first node below it
+    /// on the stack that is in `focus_ids`. It gates the node's
+    /// active-descendant claim, which counts only while it is the focused node.
     ///
     /// A focusable element with no role pushes no node, so the walk passes
     /// over it; it can never be the focused node either.
-    pub(crate) fn nearest_focusable_ancestor_is_focused(
+    pub(crate) fn nearest_focusable_ancestor(
         &self,
         focus_ids: &FxHashMap<NodeId, FocusId>,
-    ) -> bool {
+    ) -> Option<NodeId> {
         // The current node is on top of the stack; everything below it is an
         // ancestor.
         let ancestor_count = self.ids_stack.len().saturating_sub(1);
@@ -702,7 +710,7 @@ impl A11yNodeBuilder {
             .iter()
             .rev()
             .find(|id| focus_ids.contains_key(id))
-            .is_some_and(|id| self.focus == Some(*id))
+            .copied()
     }
 
     pub(crate) fn set_active_descendant(&mut self, id: NodeId) {
@@ -907,6 +915,41 @@ mod tests {
         assert_eq!(update.focus, item);
         let root = update.nodes.iter().find(|(id, _)| *id == ROOT_NODE_ID);
         assert_eq!(root.map(|(_, n)| n.children()), Some(&[container][..]));
+    }
+
+    // A claim refused last frame (its container unfocused) counts when the
+    // range replays under the container focused this frame; a claim honored
+    // last frame is dropped when the focus has left the container.
+    #[test]
+    fn a_replayed_claim_is_judged_by_this_frames_focus() {
+        let mut a11y = new_a11y();
+        let container = NodeId(1);
+        let item = NodeId(2);
+
+        push_focusable(&mut a11y, container);
+        assert!(a11y.nodes.push(item, test_node()));
+        a11y.set_active_descendant(item);
+        a11y.nodes.pop(); // item
+        a11y.nodes.pop(); // container
+        assert_eq!(a11y.end_frame(Default::default()).focus, ROOT_NODE_ID);
+
+        a11y.begin_frame();
+        a11y.reuse_range(0..2, false);
+        // The container replayed, focus arrives on it live this frame.
+        a11y.set_focusable(container, FocusId::default());
+        a11y.set_focus(container);
+        assert_eq!(a11y.nodes.active_descendant, None, "judged at the replay");
+
+        a11y.begin_frame();
+        a11y.reuse_range(0..2, true);
+        assert_eq!(a11y.nodes.focus, Some(container));
+        assert_eq!(a11y.nodes.active_descendant, Some(item));
+        assert_eq!(a11y.end_frame(Default::default()).focus, item);
+
+        a11y.begin_frame();
+        a11y.reuse_range(0..2, false);
+        assert_eq!(a11y.nodes.focus, None);
+        assert_eq!(a11y.nodes.active_descendant, None);
     }
 
     // A replayed node whose id this frame already pushed is left out, and so
@@ -1194,22 +1237,17 @@ mod tests {
         let inner = NodeId(2);
 
         push_focusable(&mut a11y, container);
-        a11y.set_focus(container);
 
-        // With the focused container itself on top, it is not its own (strict)
-        // ancestor, so the gate is false.
-        assert!(
-            !a11y
-                .nodes
-                .nearest_focusable_ancestor_is_focused(&a11y.focus_ids)
-        );
+        // With the container itself on top, it is not its own (strict)
+        // ancestor, so it has no gate.
+        assert_eq!(a11y.nodes.nearest_focusable_ancestor(&a11y.focus_ids), None);
 
         // A focusable inner node on top: its own registration does not count,
-        // the focused container is its nearest focusable ancestor.
+        // the container is its nearest focusable ancestor.
         push_focusable(&mut a11y, inner);
-        assert!(
-            a11y.nodes
-                .nearest_focusable_ancestor_is_focused(&a11y.focus_ids)
+        assert_eq!(
+            a11y.nodes.nearest_focusable_ancestor(&a11y.focus_ids),
+            Some(container)
         );
 
         a11y.nodes.pop();
