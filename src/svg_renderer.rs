@@ -312,16 +312,13 @@ fn raster_fits(width: u32, height: u32) -> bool {
 /// Whether every `VP8 ` and `VP8L` frame of a WebP, at the top level and
 /// inside each `ANMF` frame, fits at its own declared size. image-webp decodes
 /// a frame whole before it compares the frame with the `VP8X` canvas, so the
-/// canvas size alone does not bound the decode. A chunk that does not read
-/// refuses the image.
+/// canvas size alone does not bound the decode. The walk runs to the end of
+/// the bytes, not to the declared RIFF size: image-webp reads chunks past it.
+/// A chunk that does not read refuses the image.
 fn webp_frames_fit(data: &[u8]) -> bool {
-    let Some(riff_size) = data.get(4..8) else {
-        return false;
-    };
-    let riff_end = (u32::from_le_bytes(riff_size.try_into().unwrap()) as usize).saturating_add(8);
     data.get(8..12) == Some(&b"WEBP"[..])
         && data
-            .get(12..riff_end.min(data.len()))
+            .get(12..)
             .is_some_and(|chunks| webp_chunks_fit(chunks, true))
 }
 
@@ -677,18 +674,36 @@ mod tests {
     /// An extended WebP: a `VP8X` canvas of `canvas` x `canvas` around
     /// `frame`, which an `ANIM` + `ANMF` pair wraps when `animated`.
     fn webp(canvas: u32, animated: bool, frame: Vec<u8>) -> String {
+        webp_file(canvas, animated, frame, true)
+    }
+
+    /// [`webp`] whose RIFF size ends before the frame (`VP8 `/`VP8L`, or the
+    /// `ANMF`): image-webp reads chunks past the declared end anyway.
+    fn webp_frame_past_riff_end(canvas: u32, animated: bool, frame: Vec<u8>) -> String {
+        webp_file(canvas, animated, frame, false)
+    }
+
+    fn webp_file(canvas: u32, animated: bool, frame: Vec<u8>, riff_covers_frame: bool) -> String {
         let less_one = (canvas - 1).to_le_bytes();
         let flags = if animated { 0x02 } else { 0 };
         let vp8x = [&[flags, 0, 0, 0][..], &less_one[..3], &less_one[..3]].concat();
         let mut chunks = riff_chunk(b"VP8X", &vp8x);
         if animated {
             chunks.extend(riff_chunk(b"ANIM", &[0; 6]));
+        }
+        let before_frame = chunks.len();
+        if animated {
             let anmf = [&[0; 6][..], &less_one[..3], &less_one[..3], &[0; 4], &frame].concat();
             chunks.extend(riff_chunk(b"ANMF", &anmf));
         } else {
             chunks.extend(frame);
         }
-        let riff_size = (4 + chunks.len() as u32).to_le_bytes();
+        let covered = if riff_covers_frame {
+            chunks.len()
+        } else {
+            before_frame
+        };
+        let riff_size = (4 + covered as u32).to_le_bytes();
         let file = [&b"RIFF"[..], &riff_size, b"WEBP", &chunks].concat();
         data_url("image/webp", &file)
     }
@@ -706,6 +721,8 @@ mod tests {
             webp(4, false, vp8(4, 4)),
             webp(4, false, vp8l(4, 4)),
             webp(4, true, vp8(4, 4)),
+            webp_frame_past_riff_end(4, false, vp8(4, 4)),
+            webp_frame_past_riff_end(4, true, vp8(4, 4)),
         ] {
             assert!(shown(&renderer, &href)?, "{href}");
         }
@@ -718,6 +735,14 @@ mod tests {
                 webp(1, false, vp8l(8200, 8200)),
             ),
             ("ANMF frame VP8 8200", webp(1, true, vp8(8200, 8200))),
+            (
+                "VP8 8200 past the RIFF end",
+                webp_frame_past_riff_end(1, false, vp8(8200, 8200)),
+            ),
+            (
+                "ANMF frame VP8 8200 past the RIFF end",
+                webp_frame_past_riff_end(1, true, vp8(8200, 8200)),
+            ),
         ] {
             if shown(&renderer, &href)? {
                 shown_over.push(name);
