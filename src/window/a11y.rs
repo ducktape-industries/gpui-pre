@@ -64,6 +64,11 @@
 //! a frame have been prepainted, we send the resulting [`TreeUpdate`] object to
 //! the adapter and the screen reader can announce the changes.
 //!
+//! A deferred draw prepaints after everything drawn in place, when the node it
+//! was drawn in is already finished. It records that node at registration and
+//! [reopens](A11yNodeBuilder::reopen) it, so its nodes are that node's
+//! children, not the window's.
+//!
 //! #### Synthetic children
 //!
 //! Additionally, some nodes can register "synthetic children" using
@@ -553,6 +558,10 @@ pub(crate) struct A11yNodeBuilder {
     /// [`A11y::reuse_range`]); [`crate::Window::prepaint_index`] records its
     /// length. `finalize` leaves it alone.
     log: Vec<(NodeId, NodeId, accesskit::Node)>,
+    /// `(parent, children)` for every node a deferred draw built under a
+    /// parent finished earlier this frame (see [`Self::reopen`]); `finalize`
+    /// lists the children under their parent.
+    adopted: Vec<(NodeId, Vec<NodeId>)>,
     seen_ids: FxHashSet<NodeId>,
     /// The node that GPUI considers focused. Note that this may be different to
     /// what is reported to accesskit - see [`Self::active_descendant`]
@@ -573,6 +582,7 @@ impl A11yNodeBuilder {
             nodes_stack: SmallVec::new(),
             all_nodes: Vec::new(),
             log: Vec::new(),
+            adopted: Vec::new(),
             seen_ids: FxHashSet::default(),
             focus: None,
             active_descendant: None,
@@ -652,6 +662,40 @@ impl A11yNodeBuilder {
         self.nodes_stack.last_mut()
     }
 
+    /// The node on top of the stack: the parent of the next node pushed.
+    pub(crate) fn head(&self) -> Option<NodeId> {
+        self.ids_stack.last().copied()
+    }
+
+    /// Reopens `parent`, a node finished earlier this frame, for the nodes a
+    /// deferred draw registered under it builds now: they are pushed (and
+    /// logged) as its children, and [`Self::close_reopened`] hands them to it.
+    /// The node itself was finished when the elements drawn in place popped
+    /// it, so it stays in `all_nodes` and the stack holds only a collector.
+    ///
+    /// Returns `false`, and opens nothing, for the root (still on the stack)
+    /// and for a node not in this frame's tree; the draw's nodes are then the
+    /// root's children.
+    pub(crate) fn reopen(&mut self, parent: NodeId) -> bool {
+        if parent == ROOT_NODE_ID || !self.seen_ids.contains(&parent) {
+            return false;
+        }
+        self.ids_stack.push(parent);
+        self.nodes_stack
+            .push(accesskit::Node::new(accesskit::Role::GenericContainer));
+        true
+    }
+
+    /// Closes the node [`Self::reopen`] opened, keeping the children pushed
+    /// under it for `finalize`.
+    pub(crate) fn close_reopened(&mut self) {
+        if let (Some(parent), Some(collector)) = (self.ids_stack.pop(), self.nodes_stack.pop())
+            && !collector.children().is_empty()
+        {
+            self.adopted.push((parent, collector.children().to_vec()));
+        }
+    }
+
     /// Pop the current node off the stack and finalize it into the all_nodes
     /// list.
     pub(crate) fn pop(&mut self) {
@@ -667,6 +711,7 @@ impl A11yNodeBuilder {
     fn begin_frame(&mut self, window_title: Option<&SharedString>) {
         self.all_nodes.clear();
         self.log.clear();
+        self.adopted.clear();
         self.ids_stack.clear();
         self.nodes_stack.clear();
         self.seen_ids.clear();
@@ -761,6 +806,24 @@ impl A11yNodeBuilder {
         while !self.ids_stack.is_empty() {
             if let (Some(id), Some(node)) = (self.ids_stack.pop(), self.nodes_stack.pop()) {
                 self.all_nodes.push((id, node));
+            }
+        }
+
+        // A deferred draw's nodes join the node it was drawn in.
+        if !self.adopted.is_empty() {
+            let index: FxHashMap<NodeId, usize> = self
+                .all_nodes
+                .iter()
+                .enumerate()
+                .map(|(ix, (id, _))| (*id, ix))
+                .collect();
+            for (parent, children) in self.adopted.drain(..) {
+                let ix = index.get(&parent).or_else(|| index.get(&ROOT_NODE_ID));
+                if let Some(&ix) = ix {
+                    for child in children {
+                        self.all_nodes[ix].1.push_child(child);
+                    }
+                }
             }
         }
 
