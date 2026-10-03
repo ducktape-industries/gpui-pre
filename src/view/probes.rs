@@ -479,8 +479,8 @@ fn a11y_nodes_survive_cache_reuse(cx: &mut TestAppContext, deferred: bool) {
             "{frame}: shell parent"
         );
         assert_eq!(parent_of(tree, card), shell, "{frame}: card parent");
-        let btn_parent = if deferred { ROOT_NODE_ID } else { card };
-        assert_eq!(parent_of(tree, btn), btn_parent, "{frame}: btn parent");
+        // a deferred button is the card's, as one drawn in place is
+        assert_eq!(parent_of(tree, btn), card, "{frame}: btn parent");
         assert_eq!(node_with_role(tree, Role::Button), btn, "{frame}: btn id");
     };
     check(&first, "fresh");
