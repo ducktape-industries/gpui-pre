@@ -985,6 +985,9 @@ pub(crate) struct DeferredDraw {
     /// inside it, among its siblings by priority (see [`Frame::deferred_draw_traversal_order`]).
     parent: Option<usize>,
     parent_node: DispatchNodeId,
+    /// The accessibility node this draw was registered under: the nodes it builds are that
+    /// node's children, as its dispatch nodes are `parent_node`'s (see `A11yNodeBuilder::reopen`).
+    a11y_parent: Option<accesskit::NodeId>,
     element_id_stack: SmallVec<[ElementId; 32]>,
     text_style_stack: Vec<TextStyleRefinement>,
     content_mask: Option<ContentMask<Pixels>>,
@@ -3860,6 +3863,7 @@ impl Window {
                 let (
                     element,
                     parent_node,
+                    a11y_parent,
                     current_view,
                     rem_size,
                     absolute_offset,
@@ -3875,6 +3879,7 @@ impl Window {
                     (
                         deferred_draw.element.take(),
                         deferred_draw.parent_node,
+                        deferred_draw.a11y_parent,
                         deferred_draw.current_view,
                         deferred_draw.rem_size,
                         deferred_draw.absolute_offset,
@@ -3884,6 +3889,8 @@ impl Window {
                     )
                 };
                 self.next_frame.dispatch_tree.set_active_node(parent_node);
+                let reopened = self.a11y.is_active()
+                    && a11y_parent.is_some_and(|parent| self.a11y.nodes.reopen(parent));
 
                 let outer = self.prepainting_draw.replace(deferred_draw_ix);
                 let prepaint_start = self.prepaint_index();
@@ -3905,6 +3912,9 @@ impl Window {
                     self.next_frame.deferred_draws[deferred_draw_ix].element = Some(element);
                 } else {
                     self.reuse_prepaint(prepaint_range);
+                }
+                if reopened {
+                    self.a11y.nodes.close_reopened();
                 }
                 self.prepainting_draw = outer;
                 let prepaint_end = self.prepaint_index();
@@ -4026,6 +4036,7 @@ impl Window {
                     current_view: deferred_draw.current_view,
                     parent,
                     parent_node: reused_subtree.refresh_node_id(deferred_draw.parent_node),
+                    a11y_parent: deferred_draw.a11y_parent,
                     element_id_stack: deferred_draw.element_id_stack.clone(),
                     text_style_stack: deferred_draw.text_style_stack.clone(),
                     content_mask: deferred_draw.content_mask,
@@ -4541,6 +4552,7 @@ impl Window {
             current_view: self.current_view(),
             parent: self.prepainting_draw,
             parent_node,
+            a11y_parent: self.a11y.nodes.head().filter(|_| self.a11y.is_active()),
             element_id_stack: self.element_id_stack.clone(),
             text_style_stack: self.text_style_stack.clone(),
             content_mask,
