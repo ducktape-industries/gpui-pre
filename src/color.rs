@@ -917,6 +917,19 @@ impl Background {
         }
     }
 
+    /// Returns a linear gradient's payload, `(angle, [from, to], color_space)`,
+    /// if this is one ([`linear_gradient`] with [`Background::color_space`]),
+    /// None otherwise: a reader that bounds an untrusted background (a host
+    /// taking a guest's styles) rebuilds the gradient from these instead of
+    /// dropping it.
+    pub fn as_linear_gradient(&self) -> Option<(f32, [LinearColorStop; 2], ColorSpace)> {
+        (self.tag == BackgroundTag::LinearGradient).then_some((
+            self.gradient_angle_or_pattern_height,
+            self.colors,
+            self.color_space,
+        ))
+    }
+
     /// Use specified color space for color interpolation.
     ///
     /// <https://developer.mozilla.org/en-US/docs/Web/CSS/color-interpolation-method>
@@ -972,6 +985,30 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn a_linear_gradient_reads_back_as_it_was_built() {
+        let from = linear_color_stop(rgba(0xff0000ff), 0.25);
+        let to = linear_color_stop(rgba(0x0000ffff), 0.75);
+        let gradient = linear_gradient(45., from, to).color_space(ColorSpace::Oklab);
+        assert_eq!(
+            gradient.as_linear_gradient(),
+            Some((45., [from, to], ColorSpace::Oklab))
+        );
+        let (angle, [from, to], space) = gradient.as_linear_gradient().unwrap();
+        assert_eq!(
+            linear_gradient(angle, from, to).color_space(space),
+            gradient
+        );
+        assert_eq!(
+            solid_background(rgba(0xff0000ff)).as_linear_gradient(),
+            None
+        );
+        assert_eq!(
+            checkerboard(rgba(0xff0000ff), 4.).as_linear_gradient(),
+            None
+        );
+    }
 
     #[test]
     fn test_deserialize_three_value_hex_to_rgba() {
