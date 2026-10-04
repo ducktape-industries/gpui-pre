@@ -307,6 +307,13 @@ where
     pub fn get_ref(&self) -> &R {
         self.rd.whole_slice
     }
+
+    /// The bytes after what has been read: empty once the values read took the whole slice.
+    #[inline(always)]
+    #[must_use]
+    pub fn remaining_slice(&self) -> &'de [u8] {
+        self.rd.buf
+    }
 }
 
 impl<'de, R: ReadSlice<'de>, C: SerializerConfig> Deserializer<R, C> {
