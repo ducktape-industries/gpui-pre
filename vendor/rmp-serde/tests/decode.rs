@@ -567,3 +567,19 @@ fn fail_depth_limit() {
         other => panic!("unexpected result: {other:?}"),
     }
 }
+
+#[test]
+fn pass_slice_deserializer_remaining_slice() {
+    // 7, then 0xc0: one value read, one byte left over.
+    let buf = [0x07, 0xc0];
+    let mut de = Deserializer::from_read_ref(&buf[..]);
+    assert_eq!(7u8, Deserialize::deserialize(&mut de).unwrap());
+    assert_eq!([0xc0], de.remaining_slice());
+
+    // A bin is lent from the slice, not copied through a buffer.
+    let buf = [0xc4, 0x02, 0xaa, 0xbb];
+    let mut de = Deserializer::from_read_ref(&buf[..]);
+    let bytes: &[u8] = Deserialize::deserialize(&mut de).unwrap();
+    assert_eq!(buf[2..].as_ptr(), bytes.as_ptr());
+    assert!(de.remaining_slice().is_empty());
+}

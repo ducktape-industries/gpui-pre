@@ -21,6 +21,10 @@ Custom visitors that request one shape while accepting unrelated shapes must
 leave `typed` disabled. The view wire enables it only for wasm guests; it changes
 no encoded bytes or view capabilities. Native consumers keep it disabled.
 
+`Deserializer::remaining_slice` (slice reader only) is the leftover check for a
+caller that decodes from a slice: the view wire reads a `bin` as one borrowed
+slice, and upstream gives that reader no position.
+
 On a bump, reapply outlining and the default-off typed feature, restore the test
 dependency if still missing, and run upstream tests both with and without typed.
 Also run wire roundtrips, allocation/depth/invalid-input checks, all four view
