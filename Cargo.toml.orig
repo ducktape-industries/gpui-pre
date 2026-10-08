@@ -94,7 +94,7 @@ smallvec = { workspace = true }
 stacksafe = { workspace = true, optional = true }
 strum = { workspace = true }
 sum_tree = { workspace = true }
-taffy = { workspace = true, features = [
+taffy = { version = "0.14.0", default-features = false, features = [
     "std",
     "taffy_tree",
     "flexbox",
