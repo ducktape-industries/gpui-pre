@@ -2,3 +2,15 @@
 mod linux;
 
 pub use linux::{current_platform, linux_platform};
+
+/// [`set_clipboard_wait`]'s function.
+static CLIPBOARD_WAIT: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
+
+/// Sets the function the X11 clipboard calls on the main thread while a
+/// read waits for the selection owner's answer, between its polls. An owner
+/// in this process that answers only while an event loop on the main thread
+/// turns would otherwise wait out every read (as GTK, whose clipboard wait
+/// runs a nested main loop). `wait` must not block. The first one set stays.
+pub fn set_clipboard_wait(wait: fn()) {
+    let _ = CLIPBOARD_WAIT.set(wait);
+}
