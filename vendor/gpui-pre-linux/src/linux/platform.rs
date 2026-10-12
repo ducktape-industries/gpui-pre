@@ -11,7 +11,7 @@ use std::{
     fs::File,
     io::Read as _,
     os::fd::{AsFd, AsRawFd},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 #[cfg(any(feature = "wayland", feature = "x11"))]
@@ -1267,20 +1267,33 @@ pub(super) fn get_xkb_compose_state(cx: &xkb::Context) -> Option<xkb::compose::S
 pub(super) const PIPE_READ_TIMEOUT: Duration = Duration::from_secs(4);
 
 #[cfg(any(feature = "wayland", feature = "x11"))]
+/// Reads `fd` to its end, waiting at most `timeout` for each chunk. With `wait`, a wait is cut
+/// into 1 ms polls and `wait` runs between them: the writer may be this process, answering only
+/// while a loop on this thread turns (see `set_clipboard_wait`).
 pub(super) fn read_fd_with_timeout(
     mut fd: filedescriptor::FileDescriptor,
     timeout: Duration,
+    wait: Option<fn()>,
 ) -> Result<Vec<u8>> {
     fd.set_non_blocking(true)?;
     let mut buffer = Vec::new();
     let mut chunk = [0u8; 8192];
+    let mut deadline = Instant::now() + timeout;
     loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            anyhow::bail!("timed out waiting for data on pipe after {timeout:?}");
+        }
+        let slice = match wait {
+            Some(_) => left.min(Duration::from_millis(1)),
+            None => left,
+        };
         let mut poll_fds = [filedescriptor::pollfd {
             fd: fd.as_raw_fd(),
             events: filedescriptor::POLLIN,
             revents: 0,
         }];
-        let ready = match filedescriptor::poll(&mut poll_fds, Some(timeout)) {
+        let ready = match filedescriptor::poll(&mut poll_fds, Some(slice)) {
             Ok(ready) => ready,
             Err(filedescriptor::Error::Poll(err))
                 if err.kind() == std::io::ErrorKind::Interrupted =>
@@ -1290,11 +1303,17 @@ pub(super) fn read_fd_with_timeout(
             Err(err) => return Err(err.into()),
         };
         if ready == 0 {
-            anyhow::bail!("timed out waiting for data on pipe after {timeout:?}");
+            if let Some(wait) = wait {
+                wait();
+            }
+            continue;
         }
         match fd.read(&mut chunk) {
             Ok(0) => return Ok(buffer),
-            Ok(len) => buffer.extend_from_slice(&chunk[..len]),
+            Ok(len) => {
+                buffer.extend_from_slice(&chunk[..len]);
+                deadline = Instant::now() + timeout;
+            }
             Err(err)
                 if err.kind() == std::io::ErrorKind::WouldBlock
                     || err.kind() == std::io::ErrorKind::Interrupted => {}
@@ -1837,12 +1856,30 @@ mod tests {
         use std::time::{Duration, Instant};
 
         #[test]
+        fn wait_runs_between_polls_until_the_writer_answers() {
+            // The writer answers only from `wait`, as an owner on the reading thread does.
+            static WRITER: std::sync::Mutex<Option<filedescriptor::FileDescriptor>> =
+                std::sync::Mutex::new(None);
+            fn answer() {
+                if let Some(mut write) = WRITER.lock().unwrap().take() {
+                    write.write_all(b"from the loop").unwrap();
+                }
+            }
+            let pipe = filedescriptor::Pipe::new().unwrap();
+            *WRITER.lock().unwrap() = Some(pipe.write);
+
+            let bytes =
+                read_fd_with_timeout(pipe.read, Duration::from_millis(200), Some(answer)).unwrap();
+            assert_eq!(bytes, b"from the loop");
+        }
+
+        #[test]
         fn reads_data_written_before_close() {
             let mut pipe = filedescriptor::Pipe::new().unwrap();
             pipe.write.write_all(b"hello clipboard").unwrap();
             drop(pipe.write);
 
-            let bytes = read_fd_with_timeout(pipe.read, PIPE_READ_TIMEOUT).unwrap();
+            let bytes = read_fd_with_timeout(pipe.read, PIPE_READ_TIMEOUT, None).unwrap();
             assert_eq!(bytes, b"hello clipboard");
         }
 
@@ -1851,7 +1888,7 @@ mod tests {
             let pipe = filedescriptor::Pipe::new().unwrap();
             drop(pipe.write);
 
-            let bytes = read_fd_with_timeout(pipe.read, PIPE_READ_TIMEOUT).unwrap();
+            let bytes = read_fd_with_timeout(pipe.read, PIPE_READ_TIMEOUT, None).unwrap();
             assert!(bytes.is_empty());
         }
 
@@ -1862,7 +1899,7 @@ mod tests {
 
             let timeout = Duration::from_millis(50);
             let started = Instant::now();
-            let result = read_fd_with_timeout(pipe.read, timeout);
+            let result = read_fd_with_timeout(pipe.read, timeout, None);
             let elapsed = started.elapsed();
 
             let err = result.unwrap_err();
@@ -1879,7 +1916,7 @@ mod tests {
             pipe.write.write_all(b"partial").unwrap();
             let _open_writer = pipe.write;
 
-            let err = read_fd_with_timeout(pipe.read, Duration::from_millis(50)).unwrap_err();
+            let err = read_fd_with_timeout(pipe.read, Duration::from_millis(50), None).unwrap_err();
             assert!(
                 err.to_string().contains("timed out"),
                 "unexpected error: {err}"
@@ -1904,7 +1941,7 @@ mod tests {
             });
             // The total transfer (~480ms) exceeds the timeout; this only
             // passes because the timeout is re-armed per chunk.
-            let bytes = read_fd_with_timeout(pipe.read, timeout).unwrap();
+            let bytes = read_fd_with_timeout(pipe.read, timeout, None).unwrap();
             writer.join().unwrap();
             assert_eq!(bytes, vec![b'x'; 1000 * chunks]);
         }
@@ -1920,7 +1957,7 @@ mod tests {
                 let payload = payload.clone();
                 move || write.write_all(&payload).unwrap()
             });
-            let bytes = read_fd_with_timeout(pipe.read, PIPE_READ_TIMEOUT).unwrap();
+            let bytes = read_fd_with_timeout(pipe.read, PIPE_READ_TIMEOUT, None).unwrap();
             writer.join().unwrap();
             assert_eq!(bytes, payload);
         }

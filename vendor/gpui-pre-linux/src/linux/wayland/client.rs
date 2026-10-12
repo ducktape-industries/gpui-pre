@@ -2906,7 +2906,8 @@ impl Dispatch<wl_data_device::WlDataDevice, ()> for WaylandClientStatePtr {
                     drop(pipe.write);
 
                     let read_task = state.common.borrow().background_executor.spawn(async {
-                        let buffer = read_fd_with_timeout(fd, PIPE_READ_TIMEOUT)?;
+                        // off the main thread: no main-thread wait to run
+                        let buffer = read_fd_with_timeout(fd, PIPE_READ_TIMEOUT, None)?;
                         let text = String::from_utf8(buffer)?;
                         anyhow::Ok(text)
                     });
