@@ -275,7 +275,7 @@ name = "action_macros"
 path = "tests/action_macros.rs"
 
 [dependencies.accesskit]
-version = "0.24.0"
+version = "0.25.1"
 features = ["enumn"]
 
 [dependencies.anyhow]

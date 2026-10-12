@@ -56,11 +56,11 @@ default-features = false
 package = "gpui-pre"
 
 [target.'cfg(target_os = "macos")'.dependencies.accesskit]
-version = "0.24.0"
+version = "0.25.1"
 features = ["enumn"]
 
 [target.'cfg(target_os = "macos")'.dependencies.accesskit_macos]
-version = "0.26.0"
+version = "0.27.1"
 
 [target.'cfg(target_os = "macos")'.dependencies.anyhow]
 version = "1.0.86"

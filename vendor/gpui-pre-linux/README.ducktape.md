@@ -16,3 +16,9 @@ real release and press). `X11ClientState::keys_down` holds the keys pressed
 and not released; a press of one of them is reported `is_held`, and the set
 is cleared when the window loses the keyboard (`FocusOut`), since a key
 released then sends no release here.
+
+AccessKit 0.25 (`Cargo.toml` only): `accesskit` 0.24.0 → 0.25.1 and
+`accesskit_unix` 0.22 → 0.24.0, which brings `accesskit_atspi_common` 0.21:
+a disabled node no longer reads `enabled` and `sensitive` over AT-SPI. See
+the fork README's "AccessKit 0.25"; drop these two lines when the published
+crate asks for accesskit 0.25 or later.
