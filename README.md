@@ -179,6 +179,16 @@ In addition to the systems above, GPUI provides a range of smaller services that
 
 Currently, the best way to learn about these APIs is to read the Zed source code or drop a question in the [Zed Discord](https://zed.dev/community-links). We're working on improving the documentation, creating more examples, and will be publishing more guides to GPUI on our [blog](https://zed.dev/blog).
 
+### Moving a window
+
+`Window::set_bounds` moves and sizes a window's outer frame in the
+coordinates `Window::bounds` reports; `resize` keeps the origin. The backends
+that implement it are vendored: `vendor/gpui-pre-linux` (X11) and
+`vendor/gpui-pre-macos`, each 0.3.5 as published plus that one method (see
+their `README.ducktape.md`). Wayland and Windows keep the trait default, which
+only resizes. Consumers patch `gpui-pre-linux` and `gpui-pre-macos` from the
+same revision as `gpui-pre`.
+
 ### Guest wire size
 
 The fork also carries `vendor/rmp-serde` 1.3.1 with shared parser operations and a
