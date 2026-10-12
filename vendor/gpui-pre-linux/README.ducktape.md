@@ -16,3 +16,14 @@ real release and press). `X11ClientState::keys_down` holds the keys pressed
 and not released; a press of one of them is reported `is_held`, and the set
 is cleared when the window loses the keyboard (`FocusOut`), since a key
 released then sends no release here.
+
+A clipboard read's wait turns the app's main-thread loop. `read_single`
+waits on the main thread for the selection owner's answer, polling with
+1 ms sleeps for up to 4 s per target (TARGETS, then each format). An owner
+in the same process whose X events are handled by an event loop on the main
+thread (an embedded browser engine's) answers only while that loop turns,
+so every wait ran out and a paste froze the app for minutes.
+`set_clipboard_wait(fn())` (crate root) stores a function the "no event
+yet" arm calls before its sleep; the app registers its loop's non-blocking
+turn, as GTK's clipboard wait runs a nested main loop. Nothing changes
+unless it is set.
