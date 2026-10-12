@@ -1,7 +1,7 @@
 # Linux color emoji
 
-Source: https://static.crates.io/crates/gpui-pre-wgpu/gpui-pre-wgpu-0.3.7.crate
-Archive SHA-256: `f0b02657b56b09140ce542f5e4434fb96d9fdaba0fd0035ba7dba13c171ddb9b`. Published sources and the Apache-2.0 license retained; upstream tests unchanged.
+Source: https://static.crates.io/crates/gpui-pre-wgpu/gpui-pre-wgpu-0.3.8.crate
+Archive SHA-256: `439c5421cafe1a7cf68d0c0ae5cc82b26fad6b0e6345ac98d20acaf1f2463914`. Published sources and the Apache-2.0 license retained; upstream tests unchanged.
 
 One change, in `CosmicTextSystemState::load_family`: a known color emoji font
 (`check_is_known_emoji_font`) is exempt from the check that removes a face with

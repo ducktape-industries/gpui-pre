@@ -1,19 +1,19 @@
 [package]
 name = "gpui-pre-linux"
-version = "0.3.7"
+version = "0.3.8"
 edition = { workspace = true }
 publish = true
 license = "Apache-2.0"
-description = "Zed's `gpui_linux` crate (gpui-pre snapshot of zed@1a28cff)"
+description = "Zed's `gpui_linux` crate (gpui-pre snapshot of zed@279fe07)"
 repository = "https://github.com/zed-industries/zed"
 
 [package.metadata.cargo-shear]
-ignored = ["bitflags", "scap", "x11-clipboard"]
+ignored = ["scap"]
 
 [package.metadata.gpui-pre]
 zed-crate = "gpui_linux"
 zed-version = "0.1.0"
-zed-rev = "1a28cff4b409169bac058bca40dfbfeb7621d19b"
+zed-rev = "279fe070bb389b79652e52065b2f001edcc0b11b"
 
 [lib]
 path = "src/gpui_linux.rs"
@@ -24,7 +24,6 @@ name = "gpui_linux"
 default = ["wayland", "x11"]
 test-support = ["gpui/test-support"]
 wayland = [
-    "bitflags",
     "gpui_wgpu",
     "ashpd/wayland",
     "calloop-wayland-source",
@@ -46,7 +45,6 @@ x11 = [
     "x11rb",
     "xkbcommon/x11",
     "xim",
-    "x11-clipboard",
     "filedescriptor",
     "open",
     "scap?/x11",
@@ -77,7 +75,6 @@ calloop = "0.14.3"
 notify-rust = { workspace = true }
 raw-window-handle = { workspace = true }
 ashpd = { workspace = true, optional = true }
-bitflags = { workspace = true, optional = true }
 filedescriptor = { version = "0.8.2", optional = true }
 open = { version = "5.2.0", optional = true }
 xkbcommon = { version = "0.8.0", default-features = false, optional = true }
@@ -101,7 +98,6 @@ x11rb = { version = "0.13.1", features = [
     "dri3",
 ], optional = true }
 xim = { git = "https://github.com/zed-industries/xim-rs.git", rev = "16f35a2c881b815a2b6cdfd6687988e84f8447d8", features = ["x11rb-xcb", "x11rb-client"], package = "zed-xim", version = "0.4.0-zed", optional = true }
-x11-clipboard = { version = "0.9.3", optional = true }
 
 [lints]
 workspace = true
