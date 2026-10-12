@@ -31,5 +31,8 @@ thread (an embedded browser engine's) answers only while that loop turns,
 so every wait ran out and a paste froze the app for minutes.
 `set_clipboard_wait(fn())` (crate root) stores a function the "no event
 yet" arm calls before its sleep; the app registers its loop's non-blocking
-turn, as GTK's clipboard wait runs a nested main loop. Nothing changes
-unless it is set.
+turn, as GTK's clipboard wait runs a nested main loop. The Wayland read
+(`read_fd_with_timeout`, waiting on the offer's pipe) takes the same
+function: with it set, its wait is cut into 1 ms polls with the function run
+between them, within the same per-chunk timeout. Nothing changes unless it
+is set.

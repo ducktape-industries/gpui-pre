@@ -86,7 +86,8 @@ impl<T: ReceiveData> DataOffer<T> {
 
         connection.flush().unwrap();
 
-        match read_fd_with_timeout(fd, PIPE_READ_TIMEOUT) {
+        // an owner on this thread answers while its loop turns
+        match read_fd_with_timeout(fd, PIPE_READ_TIMEOUT, crate::CLIPBOARD_WAIT.get().copied()) {
             Ok(bytes) => Some(bytes),
             Err(err) => {
                 log::error!("error reading clipboard pipe: {err:?}");
