@@ -16,7 +16,7 @@ The later ones each have a section below: link wrapping, `Window::set_bounds`, b
 ### Re-applying on a gpui-pre bump
 
 1. Start a branch from `main` whose first commit is the new `gpui-pre` release exactly as published on crates.io (one commit: the tree is the unpacked `.crate`, nothing else; `diff -rq` against the unpacked archive prints nothing).
-2. `git cherry-pick -x` every patch commit of the previous bump in `git log` order (the accessibility ones: the four above, the tab-stop fix, refused nodes, the claim gate, nodes through cache reuse with `src/view/probes.rs`, focus moves that redraw two views, a div's Click answered by its click listeners; and `Window::drop_svg` with its key helpers; a held key's repeat begins no keyboard click, whose X11 half is in `vendor/gpui-pre-linux`; and `App::until_next_animation_frame`, the throttled animations' frame grid; and a deferred draw's accessibility parent; and `Background::as_linear_gradient`; and taffy 0.14.0, unless the new release itself depends on taffy 0.14 or later: then that commit is dropped, see its section). A commit that carries a `vendor/` crate (the wasm-guest gates: scheduler and zlog; `set_bounds`: linux and macos; the wgpu emoji fix) is a refresh, not a plain pick: `cherry-pick -n`, replace the vendor directory with the new published archive, reapply our delta (diff of the old vendor against the old published archive), record the new archive SHA-256 in its `README.ducktape.md`, then commit with the original message plus a note. `diff -rq <published> vendor/<crate>` must list only `README.ducktape.md` and the patched files.
+2. `git cherry-pick -x` every patch commit of the previous bump in `git log` order (the accessibility ones: the four above, the tab-stop fix, refused nodes, the claim gate, nodes through cache reuse with `src/view/probes.rs`, focus moves that redraw two views, a div's Click answered by its click listeners; and `Window::drop_svg` with its key helpers; a held key's repeat begins no keyboard click, whose X11 half is in `vendor/gpui-pre-linux`; and `App::until_next_animation_frame`, the throttled animations' frame grid; and a deferred draw's accessibility parent; and `Background::as_linear_gradient`; and taffy 0.14.0, unless the new release itself depends on taffy 0.14 or later: then that commit is dropped, see its section). A commit that carries a `vendor/` crate (the wasm-guest gates: scheduler and zlog; `set_bounds`: linux and macos; the wgpu emoji fix; the XIM client's decoding, `zed-xim`, when the new `gpui-pre-linux` asks for another `zed-xim`) is a refresh, not a plain pick: `cherry-pick -n`, replace the vendor directory with the new published archive, reapply our delta (diff of the old vendor against the old published archive), record the new archive SHA-256 in its `README.ducktape.md`, then commit with the original message plus a note. `diff -rq <published> vendor/<crate>` must list only `README.ducktape.md` and the patched files.
 3. Run this crate's own tests with the vendored siblings patched in and `test-support` on: `cargo test --lib --features test-support --config 'patch.crates-io.gpui-pre-scheduler.path="vendor/gpui-pre-scheduler"' --config 'patch.crates-io.gpui-pre-zlog.path="vendor/gpui-pre-zlog"'`, and the a11y/tab_stop tests again with `--release` (`a_second_element_with_one_id_is_refused` only records in release). Two tests `include_bytes!` zed's `assets/fonts/{ibm-plex-sans,lilex}` three directories above `src/`; fetch them from zed at the snapshot rev. Then `cargo tree --target wasm32-unknown-unknown --no-default-features -e normal` must show no `wasm-bindgen`, `js-sys`, `web-sys`, `web-time` or `getrandom`. Root `Cargo.lock` is the published one and is not committed with resolver changes.
 4. In ducktape-app and modules, set the new full rev in every `[patch.crates-io]` entry (all fork crates at one rev), then run `cargo test ax_contract` and the door tests: they fail if any of the accessibility commits is missing.
 
@@ -264,6 +264,14 @@ same revision as `gpui-pre`.
 `load_family`: a known color emoji face is not removed for lacking a Latin
 `m`. See its `README.ducktape.md`. The app repo's `font_fallback` tests pin
 the behavior.
+
+### Korean and Chinese input over XIM
+
+`vendor/zed-xim` is the X11 input-method client `gpui-pre-linux` uses, 0.4.0-zed as published plus a
+newer decoder (`xim-ctext` 0.4.1) and no panic on text it cannot decode. ibus, Ubuntu's default input
+method, sends Hangul and Chinese through Xlib in KS C 5601 and GB 2312; the published client's decoder read
+neither and `.expect()`ed the result, so the first composed syllable crashed the app. See its
+`README.ducktape.md`. Consumers patch `zed-xim` from the same revision as `gpui-pre`.
 
 ### Guest wire size
 
