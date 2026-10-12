@@ -875,19 +875,25 @@ pub trait InteractiveElement: Sized {
         self
     }
 
-    #[cfg(any(test, feature = "test-support"))]
     /// Set a key that can be used to look up this element's bounds
-    /// in the [`crate::VisualTestContext::debug_bounds`] map
-    /// This is a noop in release builds
+    /// in the [`crate::VisualTestContext::debug_bounds`] map.
+    ///
+    /// Selectors are only recorded in debug builds with the `test-support`
+    /// feature. Elsewhere this is a no-op, so `test-support` can stay enabled
+    /// in release builds without the per-frame cost.
+    #[cfg(any(test, all(debug_assertions, feature = "test-support")))]
     fn debug_selector(mut self, f: impl FnOnce() -> String) -> Self {
         self.interactivity().debug_selector = Some(f());
         self
     }
 
-    #[cfg(not(any(test, feature = "test-support")))]
     /// Set a key that can be used to look up this element's bounds
-    /// in the [`crate::VisualTestContext::debug_bounds`] map
-    /// This is a noop in release builds
+    /// in the [`crate::VisualTestContext::debug_bounds`] map.
+    ///
+    /// Selectors are only recorded in debug builds with the `test-support`
+    /// feature. Elsewhere this is a no-op, so `test-support` can stay enabled
+    /// in release builds without the per-frame cost.
+    #[cfg(not(any(test, all(debug_assertions, feature = "test-support"))))]
     #[inline]
     fn debug_selector(self, _: impl FnOnce() -> String) -> Self {
         self
@@ -1349,7 +1355,7 @@ pub trait StatefulInteractiveElement: InteractiveElement {
 
     /// Report this element as the focused node in the accessibility tree,
     /// overriding the element that holds real keyboard focus — but only while
-    /// its nearest focusable ancestor actually holds focus.
+    /// one of its ancestors actually holds focus.
     ///
     /// This implements the `aria-activedescendant` pattern for composite
     /// widgets that keep keyboard focus on a container (e.g. a menu or
@@ -1359,10 +1365,9 @@ pub trait StatefulInteractiveElement: InteractiveElement {
     /// The element must also have a [`role`][Self::role] (and an id) so it
     /// produces an accessibility node. Unlike the web's container-side
     /// `aria-activedescendant`, this is set on the descendant; GPUI honors it
-    /// only when its nearest focusable ancestor (the container) is the focused
-    /// node, so it is safe to set unconditionally on the selected child — if
-    /// the container isn't focused, even while an outer node is, the claim is
-    /// ignored.
+    /// only when a focused ancestor is present in the tree, so it is safe to
+    /// set unconditionally on the selected child — if the container isn't
+    /// focused, the claim is ignored.
     fn aria_active_descendant(mut self) -> Self {
         self.interactivity().report_active_descendant_focus = true;
         self
@@ -1400,13 +1405,6 @@ pub trait StatefulInteractiveElement: InteractiveElement {
     /// Set the toggled state for this element.
     fn aria_toggled(mut self, toggled: accesskit::Toggled) -> Self {
         self.interactivity().aria.toggled = Some(toggled);
-        self
-    }
-
-    /// Set whether this element is disabled: present and perceivable, but
-    /// not operable.
-    fn aria_disabled(mut self, disabled: bool) -> Self {
-        self.interactivity().aria.disabled = disabled;
         self
     }
 
@@ -2113,7 +2111,6 @@ pub(crate) struct AriaProperties {
     pub(crate) selected: Option<bool>,
     pub(crate) expanded: Option<bool>,
     pub(crate) toggled: Option<accesskit::Toggled>,
-    pub(crate) disabled: bool,
     pub(crate) numeric_value: Option<f64>,
     pub(crate) min_numeric_value: Option<f64>,
     pub(crate) max_numeric_value: Option<f64>,
@@ -2203,7 +2200,7 @@ pub struct Interactivity {
     #[cfg(any(feature = "inspector", debug_assertions))]
     pub(crate) source_location: Option<&'static core::panic::Location<'static>>,
 
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(any(test, all(debug_assertions, feature = "test-support")))]
     pub(crate) debug_selector: Option<String>,
 }
 
@@ -2328,9 +2325,6 @@ impl Interactivity {
 
         if let Some(focus_handle) = self.tracked_focus_handle.as_ref() {
             window.set_focus_handle(focus_handle, cx);
-            if self.in_focus_style.is_some() {
-                window.set_in_focus_reader();
-            }
 
             if window.a11y.is_active() {
                 if let Some(global_id) = global_id {
@@ -2529,7 +2523,7 @@ impl Interactivity {
 
                 let style = self.compute_style_internal(hitbox, element_state.as_mut(), window, cx);
 
-                #[cfg(any(feature = "test-support", test))]
+                #[cfg(any(test, all(debug_assertions, feature = "test-support")))]
                 if let Some(debug_selector) = &self.debug_selector {
                     window
                         .next_frame
@@ -2564,13 +2558,6 @@ impl Interactivity {
                                         // to the first item in the whole window instead of its own.
                                         if let Some(focus_handle) = &self.tracked_focus_handle {
                                             window.next_frame.tab_stops.insert(focus_handle);
-                                        }
-                                        if window.a11y.is_active()
-                                            && let Some(global_id) = global_id
-                                        {
-                                            self.paint_a11y_action_listeners(
-                                                global_id, bounds, window,
-                                            );
                                         }
                                         if let Some(hitbox) = hitbox {
                                             #[cfg(debug_assertions)]
@@ -2610,6 +2597,21 @@ impl Interactivity {
 
                                         self.paint_keyboard_listeners(window, cx);
 
+                                        if window.a11y.is_active() {
+                                            if let Some(global_id) = global_id {
+                                                if !self.a11y_action_listeners.is_empty() {
+                                                    let node_id = global_id.accesskit_node_id();
+                                                    for (action, listener) in
+                                                        self.a11y_action_listeners.drain(..)
+                                                    {
+                                                        window.on_a11y_action(
+                                                            node_id, action, listener,
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        }
+
                                         f(&style, window, cx);
 
                                         if let Some(_hitbox) = hitbox {
@@ -2634,39 +2636,6 @@ impl Interactivity {
                 ((), element_state)
             },
         );
-    }
-
-    /// Registers this element's accessibility action listeners. The Click
-    /// it advertises for its click listeners is answered by those listeners,
-    /// as a keyboard Enter on the focused element is, unless the element
-    /// answers Click itself: no pointer press is synthesized, so a node that
-    /// is scrolled out of view, clipped or covered is still the one clicked.
-    fn paint_a11y_action_listeners(
-        &mut self,
-        global_id: &GlobalElementId,
-        bounds: Bounds<Pixels>,
-        window: &mut Window,
-    ) {
-        let node_id = global_id.accesskit_node_id();
-        let answers_click = self
-            .a11y_action_listeners
-            .iter()
-            .any(|(action, _)| *action == accesskit::Action::Click);
-        if !answers_click && !self.click_listeners.is_empty() {
-            let click_listeners = self.click_listeners.clone();
-            window.on_a11y_action(node_id, accesskit::Action::Click, move |_, window, cx| {
-                let click_event = ClickEvent::Keyboard(KeyboardClickEvent {
-                    button: KeyboardButton::Enter,
-                    bounds,
-                });
-                for listener in &click_listeners {
-                    listener(&click_event, window, cx);
-                }
-            });
-        }
-        for (action, listener) in self.a11y_action_listeners.drain(..) {
-            window.on_a11y_action(node_id, action, listener);
-        }
     }
 
     #[cfg(debug_assertions)]
@@ -3054,14 +3023,10 @@ impl Interactivity {
                     //
                     // This design avoids an ABA problem that happens if you
                     // store the focus handle that registered the keypress.
-                    //
-                    // A repeat (`is_held`) begins no press and leaves the record
-                    // as it is: a key held down since before this element had
-                    // the focus never clicks it on release.
                     window.on_key_event({
                         let pending_keyboard_down = pending_keyboard_down.clone();
                         move |event: &KeyDownEvent, phase, window, _cx| {
-                            if phase.bubble() && !window.default_prevented() && !event.is_held {
+                            if phase.bubble() && !window.default_prevented() {
                                 let stroke = &event.keystroke;
                                 let is_activation_key = (stroke.key.eq("enter")
                                     || stroke.key.eq("space"))
@@ -3583,9 +3548,6 @@ impl Interactivity {
         }
         if let Some(toggled) = self.aria.toggled {
             node.set_toggled(toggled);
-        }
-        if self.aria.disabled {
-            node.set_disabled();
         }
         if let Some(value) = self.aria.numeric_value {
             node.set_numeric_value(value);
@@ -5409,23 +5371,6 @@ mod tests {
         .unwrap();
     }
 
-    /// The platform's repeat of `key`, held down.
-    fn key_repeat(cx: &mut TestAppContext, window: AnyWindowHandle, key: &str) {
-        let keystroke = Keystroke::parse(key).unwrap();
-        cx.update_window(window, |_, window, cx| {
-            window.dispatch_event(
-                KeyDownEvent {
-                    keystroke,
-                    is_held: true,
-                    prefer_character_input: false,
-                }
-                .to_platform_input(),
-                cx,
-            );
-        })
-        .unwrap();
-    }
-
     fn key_up(cx: &mut TestAppContext, window: AnyWindowHandle, key: &str) {
         let keystroke = Keystroke::parse(key).unwrap();
         cx.update_window(window, |_, window, cx| {
@@ -5545,41 +5490,6 @@ mod tests {
         key_up(&mut cx, window, "cmd-enter");
 
         assert!(clicks.borrow().is_empty(), "clicks: {:?}", clicks.borrow());
-    }
-
-    /// A key held down since before the element had the focus (a dialog
-    /// opened under a held Enter and its button took the keys) never clicks
-    /// it: the repeats that reach it begin no press, so its release finds
-    /// none.
-    #[test]
-    fn keyboard_activation_ignores_a_key_held_from_before_focus() {
-        let (mut cx, window, clicks, focus_a, focus_b) = setup_keyboard_activation_test();
-
-        focus_and_draw(&mut cx, window, &focus_b);
-        key_down(&mut cx, window, "enter");
-        focus_and_draw(&mut cx, window, &focus_a);
-        for _ in 0..3 {
-            key_repeat(&mut cx, window, "enter");
-        }
-        key_up(&mut cx, window, "enter");
-
-        assert!(clicks.borrow().is_empty(), "clicks: {:?}", clicks.borrow());
-    }
-
-    /// A press that began on the element and is held long enough to repeat
-    /// still clicks it once, on release.
-    #[test]
-    fn keyboard_activation_survives_its_own_repeats() {
-        let (mut cx, window, clicks, focus_a, _focus_b) = setup_keyboard_activation_test();
-
-        focus_and_draw(&mut cx, window, &focus_a);
-        key_down(&mut cx, window, "enter");
-        for _ in 0..3 {
-            key_repeat(&mut cx, window, "enter");
-        }
-        key_up(&mut cx, window, "enter");
-
-        assert_eq!(*clicks.borrow(), vec!["a"]);
     }
 
     /// Two sibling tab groups, each a focusable container that is *not* itself a
@@ -5726,527 +5636,5 @@ mod tests {
         assert_eq!(bounds("cell-0").origin.x, px(0.));
         assert_eq!(bounds("cell-1").origin.x, px(100.));
         assert_eq!(bounds("cell-2").origin.x, px(300.));
-    }
-
-    type ClickLog = Rc<RefCell<Vec<&'static str>>>;
-
-    const TIP_COLOR: u32 = 0x00ff00;
-    const DIALOG_COLOR: u32 = 0xff0000;
-    const MARK_COLOR: u32 = 0xffff00;
-
-    /// A tooltip: an occluding box that logs its clicks.
-    struct ClickTip {
-        size: Size<Pixels>,
-        log: ClickLog,
-    }
-
-    impl Render for ClickTip {
-        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-            let log = self.log.clone();
-            div()
-                .id("tip")
-                .w(self.size.width)
-                .h(self.size.height)
-                .bg(crate::rgb(TIP_COLOR))
-                .occlude()
-                .on_click(move |_, _, _| log.borrow_mut().push("tip"))
-        }
-    }
-
-    fn click_tip_source(
-        id: &'static str,
-        tip_size: Size<Pixels>,
-        hoverable: bool,
-        log: &ClickLog,
-    ) -> Stateful<Div> {
-        let log = log.clone();
-        let build = move |_: &mut Window, cx: &mut App| -> AnyView {
-            let log = log.clone();
-            cx.new(|_| ClickTip {
-                size: tip_size,
-                log,
-            })
-            .into()
-        };
-        let source = div().id(id).size_full();
-        if hoverable {
-            source.hoverable_tooltip(build)
-        } else {
-            source.tooltip(build)
-        }
-    }
-
-    /// Prepaints its child in a tooltip layer at `priority`, masked to its own bounds, as a host
-    /// does for a view's pane.
-    struct LayerBox {
-        priority: usize,
-        child: AnyElement,
-    }
-
-    impl IntoElement for LayerBox {
-        type Element = Self;
-
-        fn into_element(self) -> Self {
-            self
-        }
-    }
-
-    impl Element for LayerBox {
-        type RequestLayoutState = ();
-        type PrepaintState = ();
-
-        fn id(&self) -> Option<ElementId> {
-            None
-        }
-
-        fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
-            None
-        }
-
-        fn request_layout(
-            &mut self,
-            _: Option<&GlobalElementId>,
-            _: Option<&InspectorElementId>,
-            window: &mut Window,
-            cx: &mut App,
-        ) -> (LayoutId, ()) {
-            (self.child.request_layout(window, cx), ())
-        }
-
-        fn prepaint(
-            &mut self,
-            _: Option<&GlobalElementId>,
-            _: Option<&InspectorElementId>,
-            bounds: Bounds<Pixels>,
-            _: &mut (),
-            window: &mut Window,
-            cx: &mut App,
-        ) {
-            let layer = crate::TooltipLayer {
-                priority: self.priority,
-                mask: crate::ContentMask { bounds },
-            };
-            window.with_tooltip_layer(Some(layer), |window| self.child.prepaint(window, cx));
-        }
-
-        fn paint(
-            &mut self,
-            _: Option<&GlobalElementId>,
-            _: Option<&InspectorElementId>,
-            _: Bounds<Pixels>,
-            _: &mut (),
-            _: &mut (),
-            window: &mut Window,
-            cx: &mut App,
-        ) {
-            self.child.paint(window, cx);
-        }
-    }
-
-    /// The pane in a tooltip layer at `priority`, or the pane as is.
-    fn pane_in_layer(priority: Option<usize>, pane: impl IntoElement) -> AnyElement {
-        match priority {
-            Some(priority) => LayerBox {
-                priority,
-                child: pane.into_any_element(),
-            }
-            .into_any_element(),
-            None => pane.into_any_element(),
-        }
-    }
-
-    /// Hovers `at` until the tooltip there shows, and draws.
-    fn show_tooltip(cx: &mut crate::VisualTestContext, at: Point<Pixels>) {
-        cx.simulate_mouse_move(at, None, crate::Modifiers::none());
-        cx.executor().advance_clock(DEFAULT_TOOLTIP_SHOW_DELAY);
-        cx.run_until_parked();
-        cx.update(|window, cx| window.draw(cx).clear(cx));
-    }
-
-    fn quad_of(cx: &mut crate::VisualTestContext, color: u32) -> Option<crate::Quad> {
-        cx.update(|window, _| {
-            window
-                .painted_quads()
-                .into_iter()
-                .find(|quad| quad.background.as_solid() == Some(crate::rgb(color).into()))
-        })
-    }
-
-    struct DialogOverTooltipView {
-        layer: Option<usize>,
-        source_in_deferred: bool,
-        hoverable: bool,
-        log: ClickLog,
-    }
-
-    impl Render for DialogOverTooltipView {
-        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-            let source = div().size(px(20.)).child(click_tip_source(
-                "source",
-                size(px(60.), px(60.)),
-                self.hoverable,
-                &self.log,
-            ));
-            let source = if self.source_in_deferred {
-                crate::deferred(source).into_any_element()
-            } else {
-                source.into_any_element()
-            };
-            let log = self.log.clone();
-            div()
-                .size_full()
-                .child(pane_in_layer(self.layer, div().size_full().child(source)))
-                .child(
-                    crate::deferred(
-                        div()
-                            .id("dialog")
-                            .absolute()
-                            .left(px(30.))
-                            .top(px(30.))
-                            .size(px(100.))
-                            .bg(crate::rgb(DIALOG_COLOR))
-                            .occlude()
-                            .on_click(move |_, _, _| log.borrow_mut().push("dialog")),
-                    )
-                    .with_priority(2),
-                )
-        }
-    }
-
-    /// A tooltip, hoverable or plain, registered in a layer at priority 1 draws among the
-    /// deferred draws there: under a priority-2 draw that opens over it, which takes the click on
-    /// the spot they share. So does one whose source sits in a deferred draw made inside the
-    /// layer. A tooltip outside every layer still paints above every deferred draw and takes the
-    /// press: a hoverable one its click; a plain one hides once the pointer has left its source,
-    /// so no click lands.
-    #[gpui::test]
-    fn a_layered_tooltip_paints_and_takes_clicks_under_a_higher_deferred_draw(
-        cx: &mut TestAppContext,
-    ) {
-        for layer in [Some(1), None] {
-            for source_in_deferred in [false, true] {
-                for hoverable in [false, true] {
-                    let case = format!(
-                        "layer {layer:?}, source in a deferred draw: {source_in_deferred}, \
-                         hoverable: {hoverable}"
-                    );
-                    let log = ClickLog::default();
-                    let (_, cx) = cx.add_window_view({
-                        let log = log.clone();
-                        move |_, _| DialogOverTooltipView {
-                            layer,
-                            source_in_deferred,
-                            hoverable,
-                            log,
-                        }
-                    });
-                    cx.run_until_parked();
-                    show_tooltip(cx, point(px(10.), px(10.)));
-
-                    let tip = quad_of(cx, TIP_COLOR)
-                        .unwrap_or_else(|| panic!("{case}: the tooltip shows"));
-                    let dialog = quad_of(cx, DIALOG_COLOR)
-                        .unwrap_or_else(|| panic!("{case}: the dialog paints"));
-                    assert_eq!(
-                        tip.order > dialog.order,
-                        layer.is_none(),
-                        "{case}: the tooltip paints above the dialog"
-                    );
-
-                    cx.simulate_click(point(px(50.), px(50.)), crate::Modifiers::none());
-                    let clicked: &[&str] = match (layer, hoverable) {
-                        (Some(_), _) => &["dialog"],
-                        (None, true) => &["tip"],
-                        (None, false) => &[],
-                    };
-                    assert_eq!(
-                        *log.borrow(),
-                        clicked,
-                        "{case}: the click on the shared spot"
-                    );
-                }
-            }
-        }
-    }
-
-    /// A 20px tooltip source with a 60px tooltip, as a cached view counting its renders.
-    struct TipSource {
-        log: ClickLog,
-        renders: usize,
-    }
-
-    impl Render for TipSource {
-        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-            self.renders += 1;
-            div().size(px(20.)).child(click_tip_source(
-                "source",
-                size(px(60.), px(60.)),
-                false,
-                &self.log,
-            ))
-        }
-    }
-
-    struct TipUnderSiblingView {
-        source: Entity<TipSource>,
-        dialog_first: bool,
-        log: ClickLog,
-    }
-
-    impl Render for TipUnderSiblingView {
-        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-            let pane = crate::deferred(LayerBox {
-                priority: 16,
-                child: div()
-                    .size(px(200.))
-                    .child(
-                        self.source
-                            .clone()
-                            .cached(StyleRefinement::default().size(px(20.))),
-                    )
-                    .into_any_element(),
-            });
-            let log = self.log.clone();
-            let dialog = crate::deferred(
-                div()
-                    .id("dialog")
-                    .absolute()
-                    .left(px(30.))
-                    .top(px(30.))
-                    .size(px(100.))
-                    .bg(crate::rgb(DIALOG_COLOR))
-                    .occlude()
-                    .on_click(move |_, _, _| log.borrow_mut().push("dialog")),
-            )
-            .with_priority(1);
-            let root = div().size_full();
-            if self.dialog_first {
-                root.child(dialog).child(pane)
-            } else {
-                root.child(pane).child(dialog)
-            }
-        }
-    }
-
-    /// A layered tooltip draws inside the deferred draw its source was drawn in, at its layer's
-    /// priority among that draw's own: its source in a pane drawn at 0, a tooltip in a layer at
-    /// 16 paints and takes clicks under a dialog drawn at 1. It stays there when its source's
-    /// view is replayed from the cache while the pane and the dialog swap their registration
-    /// order.
-    #[gpui::test]
-    fn a_layered_tooltip_stays_under_its_source_draws_higher_sibling(cx: &mut TestAppContext) {
-        let log = ClickLog::default();
-        let (view, cx) = cx.add_window_view({
-            let log = log.clone();
-            move |_, cx| TipUnderSiblingView {
-                source: cx.new(|_| TipSource {
-                    log: log.clone(),
-                    renders: 0,
-                }),
-                dialog_first: false,
-                log,
-            }
-        });
-        cx.run_until_parked();
-        show_tooltip(cx, point(px(10.), px(10.)));
-        let tip = quad_of(cx, TIP_COLOR).expect("the tooltip shows");
-        let dialog = quad_of(cx, DIALOG_COLOR).expect("the dialog paints");
-        assert!(
-            tip.order < dialog.order,
-            "the tooltip {} over the dialog {}",
-            tip.order,
-            dialog.order
-        );
-        let renders = |cx: &mut crate::VisualTestContext| {
-            view.read_with(cx, |view, cx| view.source.read(cx).renders)
-        };
-        let before = renders(cx);
-
-        view.update(cx, |view, cx| {
-            view.dialog_first = true;
-            cx.notify();
-        });
-        cx.run_until_parked();
-        cx.update(|window, cx| window.draw(cx).clear(cx));
-        assert_eq!(renders(cx), before, "the source is replayed from its cache");
-        let tip = quad_of(cx, TIP_COLOR).expect("the tooltip still shows");
-        let dialog = quad_of(cx, DIALOG_COLOR).expect("the dialog still paints");
-        assert!(
-            tip.order < dialog.order,
-            "replayed: the tooltip {} over the dialog {}",
-            tip.order,
-            dialog.order
-        );
-
-        cx.simulate_click(point(px(50.), px(50.)), crate::Modifiers::none());
-        assert_eq!(*log.borrow(), ["dialog"]);
-    }
-
-    struct TooltipNearPaneEdgeView {
-        layer: Option<usize>,
-        log: ClickLog,
-    }
-
-    impl Render for TooltipNearPaneEdgeView {
-        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-            let list = div()
-                .absolute()
-                .left(px(150.))
-                .size(px(40.))
-                .overflow_hidden()
-                .child(click_tip_source(
-                    "row",
-                    size(px(100.), px(30.)),
-                    false,
-                    &self.log,
-                ));
-            div().size_full().child(pane_in_layer(
-                self.layer,
-                div().relative().size(px(200.)).child(list),
-            ))
-        }
-    }
-
-    /// A layered tooltip is fitted inside its layer's mask and clipped to it, not to its source's
-    /// clip: on a row of a 40px list near the right edge of a 200px pane, a 100px tooltip flips
-    /// left of the pointer and draws whole, out of the list, inside the pane. Outside every
-    /// layer it opens right of the pointer, fitted to the window.
-    #[gpui::test]
-    fn a_layered_tooltip_fits_inside_its_layer_mask_not_its_sources_clip(cx: &mut TestAppContext) {
-        let pane = Bounds::new(point(px(0.), px(0.)), size(px(200.), px(200.)));
-        for (layer, origin) in [
-            (Some(1), point(px(69.), px(11.))),
-            (None, point(px(171.), px(11.))),
-        ] {
-            let (_, cx) = cx.add_window_view(move |_, _| TooltipNearPaneEdgeView {
-                layer,
-                log: ClickLog::default(),
-            });
-            cx.run_until_parked();
-            show_tooltip(cx, point(px(170.), px(10.)));
-
-            let (scale, viewport) =
-                cx.update(|window, _| (window.scale_factor(), window.viewport_size()));
-            let tip = quad_of(cx, TIP_COLOR)
-                .unwrap_or_else(|| panic!("layer {layer:?}: the tooltip shows"));
-            assert_eq!(
-                tip.bounds,
-                Bounds::new(origin, size(px(100.), px(30.))).scale(scale),
-                "layer {layer:?}: tooltip bounds"
-            );
-            let mask = match layer {
-                Some(_) => pane,
-                None => Bounds::new(point(px(0.), px(0.)), viewport),
-            };
-            assert_eq!(
-                tip.content_mask.bounds,
-                mask.scale(scale),
-                "layer {layer:?}: tooltip mask"
-            );
-        }
-    }
-
-    struct RowList(ClickLog);
-
-    impl Render for RowList {
-        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-            div().size_full().child(click_tip_source(
-                "row",
-                size(px(100.), px(30.)),
-                false,
-                &self.0,
-            ))
-        }
-    }
-
-    struct ShrinkingPaneView {
-        pane_width: Pixels,
-        list: Entity<RowList>,
-    }
-
-    impl Render for ShrinkingPaneView {
-        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-            let list = div()
-                .absolute()
-                .left(px(150.))
-                .size(px(40.))
-                .overflow_hidden()
-                .child(
-                    self.list
-                        .clone()
-                        .cached(StyleRefinement::default().size_full()),
-                );
-            div().size_full().child(pane_in_layer(
-                Some(1),
-                div().relative().w(self.pane_width).h(px(200.)).child(list),
-            ))
-        }
-    }
-
-    /// A cached view whose bounds and clip stay put while its tooltip layer changes is drawn
-    /// anew, so its tooltip takes the new layer: a pane that shrinks from 400px to 200px around
-    /// an unchanged list refits the row's tooltip inside 200px.
-    #[gpui::test]
-    fn a_cached_views_tooltip_takes_the_layer_it_is_drawn_in_now(cx: &mut TestAppContext) {
-        let (view, cx) = cx.add_window_view(|_, cx| ShrinkingPaneView {
-            pane_width: px(400.),
-            list: cx.new(|_| RowList(ClickLog::default())),
-        });
-        cx.run_until_parked();
-        show_tooltip(cx, point(px(170.), px(10.)));
-        let scale = cx.update(|window, _| window.scale_factor());
-        let tip = quad_of(cx, TIP_COLOR).expect("the tooltip shows");
-        assert_eq!(tip.bounds.origin, point(px(171.), px(11.)).scale(scale));
-
-        view.update(cx, |view, cx| {
-            view.pane_width = px(200.);
-            cx.notify();
-        });
-        cx.run_until_parked();
-        cx.update(|window, cx| window.draw(cx).clear(cx));
-
-        let tip = quad_of(cx, TIP_COLOR).expect("the tooltip still shows");
-        assert_eq!(tip.bounds.origin, point(px(69.), px(11.)).scale(scale));
-        assert_eq!(
-            tip.content_mask.bounds,
-            Bounds::new(point(px(0.), px(0.)), size(px(200.), px(200.))).scale(scale)
-        );
-    }
-
-    struct DeferringTip;
-
-    impl Render for DeferringTip {
-        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-            div().size(px(40.)).child(crate::deferred(
-                div().size(px(20.)).bg(crate::rgb(MARK_COLOR)),
-            ))
-        }
-    }
-
-    struct DeferringTipSource;
-
-    impl Render for DeferringTipSource {
-        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-            div().size(px(20.)).child(
-                div()
-                    .id("source")
-                    .size_full()
-                    .tooltip(|_, cx| cx.new(|_| DeferringTip).into()),
-            )
-        }
-    }
-
-    /// A deferred draw inside a tooltip is prepainted, like any nested deferred draw, so it
-    /// paints.
-    #[gpui::test]
-    fn a_deferred_draw_inside_a_tooltip_paints(cx: &mut TestAppContext) {
-        let (_, cx) = cx.add_window_view(|_, _| DeferringTipSource);
-        cx.run_until_parked();
-        show_tooltip(cx, point(px(10.), px(10.)));
-
-        assert!(
-            quad_of(cx, MARK_COLOR).is_some(),
-            "the deferred draw paints"
-        );
     }
 }

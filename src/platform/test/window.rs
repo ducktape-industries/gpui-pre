@@ -56,7 +56,6 @@ pub(crate) struct TestWindowState {
     appearance: WindowAppearance,
     external_drag_files: Vec<(PathBuf, bool)>,
     start_external_drag_result: bool,
-    last_a11y_tree_update: Option<accesskit::TreeUpdate>,
 }
 
 #[derive(Clone)]
@@ -131,7 +130,6 @@ impl TestWindow {
             appearance: WindowAppearance::Light,
             external_drag_files: Vec::new(),
             start_external_drag_result: false,
-            last_a11y_tree_update: None,
         })))
     }
     pub fn simulate_scheduled_frame(&self) -> bool {
@@ -289,13 +287,6 @@ impl TestWindow {
     pub fn set_start_external_drag_result(&self, result: bool) {
         self.0.lock().start_external_drag_result = result;
     }
-
-    /// The last accessibility tree update the window sent to this test window.
-    /// A window only builds one while accessibility is active for it (see
-    /// [`crate::Window::activate_a11y`]); each update carries the whole tree.
-    pub fn last_a11y_tree_update(&self) -> Option<accesskit::TreeUpdate> {
-        self.0.lock().last_a11y_tree_update.clone()
-    }
 }
 
 impl PlatformWindow for TestWindow {
@@ -345,10 +336,6 @@ impl PlatformWindow for TestWindow {
     fn resize(&mut self, size: Size<Pixels>) {
         let mut lock = self.0.lock();
         lock.bounds.size = size;
-    }
-
-    fn set_bounds(&mut self, bounds: Bounds<Pixels>) {
-        self.0.lock().bounds = bounds;
     }
 
     fn scale_factor(&self) -> f32 {
@@ -567,10 +554,6 @@ impl PlatformWindow for TestWindow {
 
     fn as_test(&mut self) -> Option<&mut TestWindow> {
         Some(self)
-    }
-
-    fn a11y_tree_update(&self, tree_update: accesskit::TreeUpdate) {
-        self.0.lock().last_a11y_tree_update = Some(tree_update);
     }
 
     #[cfg(target_os = "windows")]

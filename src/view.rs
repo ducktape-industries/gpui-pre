@@ -2,7 +2,7 @@ use crate::{
     AnyElement, AnyEntity, AnyWeakEntity, App, AvailableSpace, Bounds, ContentMask, Context,
     Element, ElementId, Entity, EntityId, GlobalElementId, InspectorElementId, IntoElement,
     LayoutId, PaintIndex, Pixels, PrepaintStateIndex, Render, RenderOnce, Size, Style,
-    StyleRefinement, TextStyle, TooltipLayer, WeakEntity,
+    StyleRefinement, TextStyle, WeakEntity,
 };
 use crate::{Empty, Window};
 use anyhow::Result;
@@ -158,9 +158,6 @@ impl std::fmt::Debug for AnyWeakView {
     }
 }
 
-#[cfg(test)]
-mod probes;
-
 mod any_view {
     use crate::{AnyElement, AnyView, App, IntoElement, Render, Window};
 
@@ -306,7 +303,6 @@ struct ViewElementCacheKey {
     bounds: Bounds<Pixels>,
     content_mask: ContentMask<Pixels>,
     text_style: TextStyle,
-    tooltip_layer: Option<TooltipLayer>,
 }
 
 impl<V: View> Element for ViewElement<V> {
@@ -484,13 +480,11 @@ fn prepaint_view(
             |element_state, window| {
                 let content_mask = window.content_mask();
                 let text_style = window.text_style();
-                let tooltip_layer = window.tooltip_layer;
 
                 if let Some(mut element_state) = element_state
                     && element_state.cache_key.bounds == bounds
                     && element_state.cache_key.content_mask == content_mask
                     && element_state.cache_key.text_style == text_style
-                    && element_state.cache_key.tooltip_layer == tooltip_layer
                     && !window.dirty_views.contains(&entity_id)
                     && !window.refreshing
                 {
@@ -526,7 +520,6 @@ fn prepaint_view(
                             bounds,
                             content_mask,
                             text_style,
-                            tooltip_layer,
                         },
                     },
                 )

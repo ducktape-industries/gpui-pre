@@ -356,7 +356,7 @@ impl VisualTestAppContext {
         predicate: impl Fn(&T) -> bool,
         timeout: Duration,
     ) -> Result<()> {
-        let start = scheduler::Instant::now();
+        let start = web_time::Instant::now();
         loop {
             {
                 let app = self.app.borrow();
