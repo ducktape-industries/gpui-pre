@@ -411,6 +411,10 @@ impl Inner {
             let event = match event {
                 Some(e) => e,
                 None => {
+                    // an owner on this thread answers while its loop turns
+                    if let Some(wait) = crate::CLIPBOARD_WAIT.get() {
+                        wait();
+                    }
                     std::thread::sleep(Duration::from_millis(1));
                     continue;
                 }

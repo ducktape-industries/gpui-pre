@@ -22,3 +22,14 @@ AccessKit 0.25 (`Cargo.toml` only): `accesskit` 0.24.0 → 0.25.1 and
 a disabled node no longer reads `enabled` and `sensitive` over AT-SPI. See
 the fork README's "AccessKit 0.25"; drop these two lines when the published
 crate asks for accesskit 0.25 or later.
+
+A clipboard read's wait turns the app's main-thread loop. `read_single`
+waits on the main thread for the selection owner's answer, polling with
+1 ms sleeps for up to 4 s per target (TARGETS, then each format). An owner
+in the same process whose X events are handled by an event loop on the main
+thread (an embedded browser engine's) answers only while that loop turns,
+so every wait ran out and a paste froze the app for minutes.
+`set_clipboard_wait(fn())` (crate root) stores a function the "no event
+yet" arm calls before its sleep; the app registers its loop's non-blocking
+turn, as GTK's clipboard wait runs a nested main loop. Nothing changes
+unless it is set.
