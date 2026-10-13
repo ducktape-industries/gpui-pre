@@ -505,7 +505,7 @@ fn a11y_nodes_survive_cache_reuse(cx: &mut TestAppContext, deferred: bool) {
         let element = window
             .a11y_element_id(btn)
             .expect("btn still has an element id");
-        assert_eq!(element.0.last(), Some(&ElementId::from("btn")));
+        assert_eq!(element.last(), Some(&ElementId::from("btn")));
         window.dispatch_a11y_action(request(Action::Click, btn), cx);
     });
     assert_eq!(

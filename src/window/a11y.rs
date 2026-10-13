@@ -925,7 +925,7 @@ mod tests {
     }
 
     fn element(name: &'static str) -> GlobalElementId {
-        GlobalElementId(Arc::from([ElementId::Name(name.into())]))
+        GlobalElementId::new(&[ElementId::Name(name.into())])
     }
 
     // A second element with an id already used this frame: panic in debug; in

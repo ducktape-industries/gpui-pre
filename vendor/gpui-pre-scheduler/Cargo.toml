@@ -12,7 +12,7 @@
 [package]
 edition = "2024"
 name = "gpui-pre-scheduler"
-version = "0.3.8"
+version = "0.3.9"
 build = false
 publish = true
 autolib = false
@@ -20,7 +20,7 @@ autobins = false
 autoexamples = false
 autotests = false
 autobenches = false
-description = "Zed's `scheduler` crate (gpui-pre snapshot of zed@279fe07)"
+description = "Zed's `scheduler` crate (gpui-pre snapshot of zed@93d7456)"
 readme = false
 license = "Apache-2.0"
 repository = "https://github.com/zed-industries/zed"
@@ -29,7 +29,7 @@ resolver = "2"
 [package.metadata.gpui-pre]
 zed-crate = "scheduler"
 zed-version = "0.1.0"
-zed-rev = "279fe070bb389b79652e52065b2f001edcc0b11b"
+zed-rev = "93d745668805029476e6d7fbb19652116fed51de"
 
 [features]
 default = ["web"]
@@ -37,8 +37,6 @@ web = [
     "dep:web-time",
     "chrono/wasmbind",
     "rand/os_rng",
-    "rand/thread_rng",
-    "flume/default",
 ]
 test-support = []
 wasm-threads = [
@@ -60,16 +58,17 @@ version = "0.3"
 
 [dependencies.chrono]
 version = "0.4"
+features = [
+    "std",
+    "serde",
+    "now",
+]
 default-features = false
-features = ["serde", "clock", "std"]
 
 [dependencies.flume]
 version = "0.12"
-default-features = false
 features = ["async"]
-
-[target.'cfg(not(target_family = "wasm"))'.dependencies.flume]
-version = "0.12"
+default-features = false
 
 [dependencies.futures]
 version = "0.3.34"
@@ -79,11 +78,16 @@ version = "0.12.1"
 
 [dependencies.rand]
 version = "0.9"
+features = [
+    "std",
+    "std_rng",
+]
 default-features = false
-features = ["std", "std_rng", "small_rng"]
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies.rand]
 version = "0.9"
+features = ["os_rng"]
+default-features = false
 
 [dependencies.web-time]
 version = "1.1.0"
