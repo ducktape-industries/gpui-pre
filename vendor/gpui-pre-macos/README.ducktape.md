@@ -12,3 +12,11 @@ AccessKit 0.25 (`Cargo.toml` only): `accesskit` 0.24.0 → 0.25.1 and
 also changes what VoiceOver reads: sub-roles, labels as values for some roles,
 live regions announce the label). See the fork README's "AccessKit 0.25"; drop these
 two lines when the published crate asks for accesskit 0.25 or later.
+
+Korean first key (`src/window.rs`): `interpret_key` replaces the key handler's two
+`handleEvent:` calls and reads a key again when Apple's Korean input method
+committed only its bare jamo (`insertText:`) into a field that reports no
+selection, which cannot give the jamo back for the input method to compose
+into; `KoreanKey` and `korean_key_answer` hold the jamo back meanwhile. See the
+fork README's "Korean input's first key on macOS". Drop it when the input
+method stops committing the first key, or upstream reads the key again itself.
