@@ -250,8 +250,16 @@ impl GlobalElementId {
         }
     }
 
+    /// The id of the accessibility node this element builds: a SipHash of
+    /// the id path, not the cached path hash. That hash is made for map
+    /// lookups, and an element id can be solved to give it any value, so a
+    /// caller that draws ids it does not choose (an embedded, untrusted
+    /// view) could otherwise be handed the node id of another element.
     pub(crate) fn accesskit_node_id(&self) -> accesskit::NodeId {
-        accesskit::NodeId(self.hash)
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::hash::DefaultHasher::default();
+        self.ids.hash(&mut hasher);
+        accesskit::NodeId(hasher.finish())
     }
 }
 
@@ -999,5 +1007,122 @@ mod global_element_id_tests {
             cached.as_nanos() as f64 / n as f64,
             build.as_nanos() as f64 / n as f64,
         );
+    }
+}
+
+#[cfg(test)]
+mod node_id_tests {
+    //! An accessibility node id must not be solvable from an element id: see
+    //! the README, "A node id a view cannot solve".
+    use super::*;
+    use std::hash::{Hash, Hasher};
+
+    /// The multiplier of `rustc_hash::FxHasher` on a 64-bit target, and the
+    /// rotation its `finish` applies (rustc-hash 2.1).
+    const FX_K: u64 = 0xf135_7aea_2e62_a9c5;
+    const FX_ROTATE: u32 = 26;
+
+    /// What a failed precondition means: the forgery below was derived for
+    /// one hasher, and says nothing once that hasher changes.
+    const RE_DERIVE: &str = "the forged id no longer collides in the cached path hash, so \
+        `FxHasher`'s arithmetic, `extend_path_hash` or `ElementId`'s layout changed. That is not \
+        the property under test: re-derive the forgery for the new arithmetic, or drop the fork \
+        patch if the path hash can no longer be solved (README, \"A node id a view cannot solve\")";
+
+    /// `FX_K` is odd, so it has an inverse modulo 2^64.
+    fn fx_k_inverse() -> u64 {
+        let mut inverse = FX_K;
+        for _ in 0..6 {
+            inverse = inverse.wrapping_mul(2u64.wrapping_sub(FX_K.wrapping_mul(inverse)));
+        }
+        assert_eq!(FX_K.wrapping_mul(inverse), 1);
+        inverse
+    }
+
+    fn id(prefix: &[ElementId], last: ElementId) -> GlobalElementId {
+        GlobalElementId::new(&[prefix, &[last]].concat())
+    }
+
+    #[test]
+    fn a_node_id_is_not_solvable_from_an_element_id() {
+        let k_inverse = fx_k_inverse();
+        let shell = ElementId::Name("shell".into());
+        let view = [shell.clone(), ElementId::Name("view/chat".into())];
+
+        // A view that knows the path it is drawn under picks the integer
+        // that lands on a host control's path hash. `Integer(x)` hashes its
+        // discriminant, 1, then `x`, each an add and a multiply by `FX_K`.
+        let host = id(&[shell], ElementId::Name("approve".into()));
+        let prefix_hash = GlobalElementId::new(&view).hash;
+        let x = host
+            .hash
+            .rotate_right(FX_ROTATE)
+            .wrapping_mul(k_inverse)
+            .wrapping_sub(prefix_hash.wrapping_add(1).wrapping_mul(FX_K));
+        let forged = id(&view, ElementId::Integer(x));
+        assert_ne!(forged, host);
+        assert_eq!(forged.hash, host.hash, "{RE_DERIVE}");
+        assert_ne!(
+            forged.accesskit_node_id(),
+            host.accesskit_node_id(),
+            "an integer id a view chose took a host control's node id"
+        );
+
+        // Two sibling ids with one path hash under every prefix, found with
+        // no knowledge of the host: the name's term and the integer add up.
+        let name_term = |name: &'static str| {
+            let mut hasher = collections::FxHasher::with_seed(0);
+            crate::SharedString::from(name).hash(&mut hasher);
+            hasher
+                .finish()
+                .rotate_right(FX_ROTATE)
+                .wrapping_mul(k_inverse)
+                .wrapping_sub(0xff)
+                .wrapping_mul(k_inverse)
+        };
+        let row = 7u64;
+        let cell = row.wrapping_add(
+            name_term("row")
+                .wrapping_sub(name_term("cell"))
+                .wrapping_mul(FX_K)
+                .wrapping_mul(FX_K),
+        );
+        for prefix in [&[][..], &view[..]] {
+            let row = id(prefix, ElementId::NamedInteger("row".into(), row));
+            let cell = id(prefix, ElementId::NamedInteger("cell".into(), cell));
+            assert_ne!(row, cell);
+            assert_eq!(row.hash, cell.hash, "{RE_DERIVE}");
+            assert_ne!(
+                row.accesskit_node_id(),
+                cell.accesskit_node_id(),
+                "two sibling ids a view chose share a node id"
+            );
+        }
+    }
+
+    /// The node id is the value gpui-pre 0.3.8 gave the same path: the hash
+    /// its `GlobalElementId` derived, a tuple struct over the ids.
+    #[test]
+    fn a_node_id_is_the_one_0_3_8_gave_the_path() {
+        #[derive(Hash)]
+        struct Before(Arc<[ElementId]>);
+
+        let paths: [&[ElementId]; 3] = [
+            &[],
+            &[ElementId::Name("shell".into())],
+            &[
+                ElementId::Name("shell".into()),
+                ElementId::Integer(7),
+                ElementId::NamedInteger("row".into(), 3),
+            ],
+        ];
+        for ids in paths {
+            let mut hasher = std::hash::DefaultHasher::default();
+            Before(Arc::from(ids)).hash(&mut hasher);
+            assert_eq!(
+                GlobalElementId::new(ids).accesskit_node_id(),
+                accesskit::NodeId(hasher.finish())
+            );
+        }
     }
 }
