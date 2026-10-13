@@ -29,14 +29,16 @@ use crate::gestures::{GestureTuning, RecognizedTouchGesture, TouchGestureRecogni
 use crate::interactive::TouchEvent;
 use anyhow::{Context as _, Result, anyhow};
 use collections::{FxHashMap, FxHashSet};
-#[cfg(any(target_os = "macos", target_os = "ios"))]
-use core_video::pixel_buffer::CVPixelBuffer;
 use derive_more::{Deref, DerefMut};
 use futures::channel::oneshot;
 use gpui_util::post_inc;
 use gpui_util::{ResultExt, measure};
 use itertools::FoldWhile::{Continue, Done};
 use itertools::Itertools;
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+use objc2_core_foundation::CFRetained;
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+use objc2_core_video::CVPixelBuffer;
 use parking_lot::RwLock;
 use raw_window_handle::{HandleError, HasDisplayHandle, HasWindowHandle};
 use refineable::Refineable;
@@ -968,39 +970,63 @@ pub(crate) struct TooltipBounds {
 pub(crate) struct TooltipRequest {
     id: TooltipId,
     tooltip: AnyTooltip,
-    layer: Option<TooltipLayer>,
-    /// The deferred draw prepainting when the tooltip was registered: a layered tooltip draws
-    /// inside it.
-    parent: Option<usize>,
 }
 
-/// Where the tooltips registered inside [`Window::with_tooltip_layer`] draw: as a deferred draw
-/// at `priority` inside the deferred draw their source was drawn in (among the root draws when
-/// none), fitted inside and clipped to `mask`, so they paint and take clicks only there and never
-/// above a sibling draw of higher priority. A tooltip registered outside every layer draws above
-/// every deferred draw, unclipped, fitted to the window.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TooltipLayer {
-    /// The deferred-draw priority the tooltip draws at.
-    pub priority: usize,
-    /// The region the tooltip is fitted inside and clipped to.
-    pub mask: ContentMask<Pixels>,
+/// The ids of the elements being drawn, root first, with the hash of every
+/// prefix alongside: a [`GlobalElementId`] for the current element is then
+/// the ids cloned out and the hash on top of the stack, without walking the
+/// path — the ids of every ancestor, string names byte by byte — for each
+/// element on every frame.
+#[derive(Clone, Default)]
+pub(crate) struct ElementIdStack {
+    ids: SmallVec<[ElementId; 32]>,
+    hashes: SmallVec<[u64; 32]>,
+}
+
+impl ElementIdStack {
+    pub(crate) fn push(&mut self, id: ElementId) {
+        self.hashes.push(crate::extend_path_hash(self.hash(), &id));
+        self.ids.push(id);
+    }
+
+    pub(crate) fn pop(&mut self) -> Option<ElementId> {
+        self.hashes.pop();
+        self.ids.pop()
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.ids.clear();
+        self.hashes.clear();
+    }
+
+    /// The hash of the whole path on the stack.
+    fn hash(&self) -> u64 {
+        self.hashes
+            .last()
+            .copied()
+            .unwrap_or(crate::EMPTY_PATH_HASH)
+    }
+
+    pub(crate) fn global_id(&self) -> GlobalElementId {
+        GlobalElementId::with_hash(&self.ids, self.hash())
+    }
+}
+
+impl std::ops::Deref for ElementIdStack {
+    type Target = [ElementId];
+
+    fn deref(&self) -> &Self::Target {
+        &self.ids
+    }
 }
 
 pub(crate) struct DeferredDraw {
     current_view: EntityId,
     priority: usize,
-    /// The deferred draw prepainting when this one was registered: this one paints and hits
-    /// inside it, among its siblings by priority (see [`Frame::deferred_draw_traversal_order`]).
-    parent: Option<usize>,
     parent_node: DispatchNodeId,
-    /// The accessibility node this draw was registered under: the nodes it builds are that
-    /// node's children, as its dispatch nodes are `parent_node`'s (see `A11yNodeBuilder::reopen`).
-    a11y_parent: Option<accesskit::NodeId>,
-    element_id_stack: SmallVec<[ElementId; 32]>,
+    element_id_stack: ElementIdStack,
     text_style_stack: Vec<TextStyleRefinement>,
     content_mask: Option<ContentMask<Pixels>>,
-    tooltip_layer: Option<TooltipLayer>,
     rem_size: Pixels,
     element: Option<AnyElement>,
     absolute_offset: Point<Pixels>,
@@ -1041,9 +1067,6 @@ pub(crate) struct PrepaintStateIndex {
     dispatch_tree_index: usize,
     accessed_element_states_index: usize,
     line_layout_index: LineLayoutIndex,
-    /// Into the a11y node log (see `A11yNodeBuilder::log`); stale and unused
-    /// while accessibility is inactive (reuse checks `rendered.built`).
-    a11y_index: usize,
 }
 
 #[derive(Clone, Default)]
@@ -1140,43 +1163,9 @@ impl Frame {
     }
 
     pub(crate) fn hit_test(&self, position: Point<Pixels>) -> HitTest {
-        // Hit order is paint order, reversed. The deferred draws' hitboxes sit in `hitboxes` in
-        // prepaint order, round by round, but the draws paint by priority among siblings, a draw
-        // after the draw it was made in, so they are walked draw by draw in paint order. Before them lie the root's (and the
-        // inspector's) hitboxes, after them the prompt's or the drag's.
-        let hitbox_range = |draw: &DeferredDraw| {
-            draw.prepaint_range.start.hitboxes_index..draw.prepaint_range.end.hitboxes_index
-        };
-        let deferred_start = self
-            .deferred_draws
-            .iter()
-            .map(|draw| hitbox_range(draw).start)
-            .min()
-            .unwrap_or(self.hitboxes.len());
-        let deferred_end = self
-            .deferred_draws
-            .iter()
-            .map(|draw| hitbox_range(draw).end)
-            .max()
-            .unwrap_or(deferred_start);
-        let deferred = self
-            .deferred_draw_traversal_order()
-            .into_iter()
-            .rev()
-            .flat_map(|ix| {
-                self.hitboxes[hitbox_range(&self.deferred_draws[ix])]
-                    .iter()
-                    .rev()
-            });
-        let hitboxes = self.hitboxes[deferred_end..]
-            .iter()
-            .rev()
-            .chain(deferred)
-            .chain(self.hitboxes[..deferred_start].iter().rev());
-
         let mut set_hover_hitbox_count = false;
         let mut hit_test = HitTest::default();
-        for hitbox in hitboxes {
+        for hitbox in self.hitboxes.iter().rev() {
             let bounds = hitbox.bounds.intersect(&hitbox.content_mask.bounds);
             if bounds.contains(&position) {
                 hit_test.ids.push(hitbox.id);
@@ -1195,32 +1184,6 @@ impl Frame {
             hit_test.hover_hitbox_count = hit_test.ids.len();
         }
         hit_test
-    }
-
-    /// The deferred draws in paint order, a tree: by priority among siblings, in registration
-    /// order within one priority, a draw after the draw it was made in and before that draw's
-    /// next sibling. A draw made in a draw of lower priority than a sibling of its parent paints
-    /// under that sibling, whatever its own priority.
-    fn deferred_draw_traversal_order(&self) -> SmallVec<[usize; 8]> {
-        let draws = &self.deferred_draws;
-        let mut by_priority = (0..draws.len()).collect::<SmallVec<[usize; 8]>>();
-        by_priority.sort_by_key(|ix| draws[*ix].priority);
-        let mut roots = SmallVec::<[usize; 8]>::new();
-        let mut children: SmallVec<[SmallVec<[usize; 2]>; 8]> =
-            smallvec::smallvec![SmallVec::new(); draws.len()];
-        for ix in by_priority {
-            match draws[ix].parent {
-                Some(parent) => children[parent].push(ix),
-                None => roots.push(ix),
-            }
-        }
-        let mut order = SmallVec::with_capacity(draws.len());
-        let mut stack = roots.into_iter().rev().collect::<SmallVec<[usize; 8]>>();
-        while let Some(ix) = stack.pop() {
-            order.push(ix);
-            stack.extend(children[ix].iter().rev().copied());
-        }
-        order
     }
 
     pub(crate) fn focus_path(&self) -> SmallVec<[FocusId; 8]> {
@@ -1255,7 +1218,8 @@ pub struct Window {
     pub(crate) invalidator: WindowInvalidator,
     pub(crate) removed: bool,
     pub(crate) platform_window: Box<dyn PlatformWindow>,
-    display_id: Option<DisplayId>,
+    pub(crate) display_id: Option<DisplayId>,
+    pub(crate) display_observers: SubscriberSet<(), AnyObserver>,
     is_resizable: bool,
     is_minimizable: bool,
     sprite_atlas: Arc<dyn PlatformAtlas>,
@@ -1270,14 +1234,11 @@ pub struct Window {
     pub(crate) viewport_size: Size<Pixels>,
     layout_engine: Option<TaffyLayoutEngine>,
     pub(crate) root: Option<AnyView>,
-    pub(crate) element_id_stack: SmallVec<[ElementId; 32]>,
+    pub(crate) element_id_stack: ElementIdStack,
     pub(crate) text_style_stack: Vec<TextStyleRefinement>,
     pub(crate) rendered_entity_stack: Vec<EntityId>,
     pub(crate) element_offset_stack: Vec<Point<Pixels>>,
     pub(crate) element_opacity: f32,
-    pub(crate) tooltip_layer: Option<TooltipLayer>,
-    /// The deferred draw being prepainted: the parent of every draw and tooltip registered now.
-    prepainting_draw: Option<usize>,
     pub(crate) content_mask_stack: Vec<ContentMask<Pixels>>,
     pub(crate) requested_autoscroll: Option<Bounds<Pixels>>,
     /// The [`TextInputConfiguration`] most recently forwarded to the platform
@@ -1316,7 +1277,7 @@ pub struct Window {
     /// Used to selectively enable VRR optimization only when input rate exceeds 60fps.
     pub(crate) input_rate_tracker: Rc<RefCell<InputRateTracker>>,
     #[cfg(feature = "profiler")]
-    window_profiler: profiler::WindowProfiler,
+    pub(crate) window_profiler: profiler::WindowProfiler,
     last_input_modality: InputModality,
     touch_gestures: TouchGestureRecognizer,
     touch_prediction_enabled: bool,
@@ -1713,7 +1674,7 @@ impl Window {
             }
             let initial_tree = accesskit::TreeUpdate {
                 nodes: vec![(ROOT_NODE_ID, initial_root_node)],
-                tree: Some(accesskit::TreeInfo::new(ROOT_NODE_ID)),
+                tree: Some(accesskit::Tree::new(ROOT_NODE_ID)),
                 tree_id: accesskit::TreeId::ROOT,
                 focus: ROOT_NODE_ID,
             };
@@ -1925,6 +1886,10 @@ impl Window {
                     measure("frame duration", || {
                         handle
                             .update(&mut cx, |_, window, cx| {
+                                #[cfg(feature = "profiler")]
+                                window
+                                    .window_profiler
+                                    .record_frame_signal(request_frame_options.signal_at);
                                 if force_render {
                                     // Bypass cached view reuse so we don't replay stale
                                     // atlas tile references after a GPU device recovery.
@@ -2002,6 +1967,10 @@ impl Window {
                     .update(&mut cx, |_, window, cx| window.bounds_changed(cx))
                     .log_err();
             }
+        }));
+        platform_window.on_display_changed(Box::new({
+            let cx = cx.to_async();
+            move || cx.update(|cx| Window::display_changed(handle, cx))
         }));
         platform_window.on_appearance_changed(Box::new({
             let cx = cx.to_async();
@@ -2158,6 +2127,7 @@ impl Window {
             removed: false,
             platform_window,
             display_id,
+            display_observers: SubscriberSet::new(),
             is_resizable,
             is_minimizable,
             sprite_atlas,
@@ -2168,14 +2138,12 @@ impl Window {
             viewport_size: content_size,
             layout_engine: Some(TaffyLayoutEngine::new()),
             root: None,
-            element_id_stack: SmallVec::default(),
+            element_id_stack: ElementIdStack::default(),
             text_style_stack: Vec::new(),
             rendered_entity_stack: Vec::new(),
             element_offset_stack: Vec::new(),
             content_mask_stack: Vec::new(),
             element_opacity: 1.0,
-            tooltip_layer: None,
-            prepainting_draw: None,
             requested_autoscroll: None,
             last_text_input_configuration: None,
             focused_text_input_active: false,
@@ -2440,11 +2408,11 @@ impl Window {
             return;
         }
 
-        let previous = self.focus.replace(handle.id);
+        self.focus = Some(handle.id);
         self.focus_generation = self.focus_generation.wrapping_add(1);
         self.clear_pending_keystrokes(cx);
 
-        self.invalidate_focus_move(previous, Some(handle.id));
+        self.refresh();
     }
 
     /// Remove focus from all elements within this context's window.
@@ -2458,31 +2426,8 @@ impl Window {
         if self.focus.is_some() {
             self.focus_generation = self.focus_generation.wrapping_add(1);
         }
-        let previous = self.focus.take();
-        self.invalidate_focus_move(previous, None);
-    }
-
-    /// A focus move redraws the views that rendered the old and the new focus
-    /// ids (and their ancestors), not the whole window: `refresh` made every
-    /// cached view miss on the next draw. The views that rendered an `in_focus`
-    /// reader under either id redraw too: `within_focused` is read in the
-    /// reader's own prepaint, which a cached view replays. A view that reads a
-    /// focus handle it did not render must observe focus to see the move. Like
-    /// `refresh`, this is a no-op while a draw is in progress: `draw` schedules
-    /// the frame for a move made by its focus listeners.
-    fn invalidate_focus_move(&mut self, previous: Option<FocusId>, next: Option<FocusId>) {
-        if !self.invalidator.not_drawing() {
-            return;
-        }
-        for focus_id in [previous, next].into_iter().flatten() {
-            let tree = &self.rendered_frame.dispatch_tree;
-            let mut views = tree.views_reading_focus_within(focus_id);
-            views.extend(tree.view_of_focusable(focus_id));
-            for view_id in views {
-                self.mark_view_dirty(view_id);
-            }
-        }
-        self.invalidator.set_dirty(true);
+        self.focus = None;
+        self.refresh();
     }
 
     /// Blur the window and don't allow anything in it to be focused again.
@@ -2846,7 +2791,6 @@ impl Window {
     pub fn bounds_changed(&mut self, cx: &mut App) {
         self.scale_factor = self.platform_window.scale_factor();
         self.viewport_size = self.platform_window.content_size();
-        self.display_id = self.platform_window.display().map(|display| display.id());
         self.mouse_position = self.platform_window.mouse_position();
 
         self.refresh();
@@ -2854,6 +2798,65 @@ impl Window {
         self.bounds_observers
             .clone()
             .retain(&(), |callback| callback(self, cx));
+    }
+
+    fn display_changed(handle: AnyWindowHandle, cx: &mut App) {
+        let moved_to = handle
+            .update(cx, |_, window, _| {
+                let display_id = window.platform_window.display().map(|display| display.id());
+                let moved = display_id != window.display_id;
+                window.display_id = display_id;
+                moved.then_some(display_id)
+            })
+            .log_err()
+            .flatten();
+        let Some(display_id) = moved_to else {
+            return;
+        };
+        // The platform's notifications about the window and about displays
+        // arrive in no guaranteed order, so make sure App knows the display
+        // before the window's observers read its state.
+        if let Some(display_id) = display_id
+            && !cx.knows_display(display_id)
+        {
+            cx.displays_changed();
+        }
+        handle
+            .update(cx, |_, window, cx| window.notify_display_observers(cx))
+            .log_err();
+    }
+
+    pub(crate) fn notify_display_observers(&mut self, cx: &mut App) {
+        self.display_observers
+            .clone()
+            .retain(&(), |callback| callback(self, cx));
+    }
+
+    /// The time between refreshes of the display the window is on, as of the
+    /// platform's last display change notification. Variable refresh rate
+    /// displays report their maximum rate. Returns `None` when the platform
+    /// doesn't report it.
+    pub fn refresh_interval(&self, cx: &App) -> Option<Duration> {
+        cx.display_refresh_interval(self.display_id?)
+    }
+
+    /// Registers a callback invoked when the window moves to another display
+    /// or its display's properties change, for example its refresh
+    /// interval. [`Self::refresh_interval`] already returns the new value
+    /// when the callback runs.
+    pub fn observe_window_display(
+        &self,
+        mut callback: impl FnMut(&mut Window, &mut App) + 'static,
+    ) -> Subscription {
+        let (subscription, activate) = self.display_observers.insert(
+            (),
+            Box::new(move |window, cx| {
+                callback(window, cx);
+                true
+            }),
+        );
+        activate();
+        subscription
     }
 
     /// Returns the bounds of the current window in the global coordinate space, which could span across multiple displays.
@@ -2888,13 +2891,6 @@ impl Window {
     /// Set the content size of the window.
     pub fn resize(&mut self, size: Size<Pixels>) {
         self.platform_window.resize(size);
-    }
-
-    /// Move and resize the window's outer frame, in the coordinates
-    /// [`Self::bounds`] reports. Implemented on macOS and X11; elsewhere
-    /// (Wayland, whose clients can't position windows) it only resizes.
-    pub fn set_bounds(&mut self, bounds: Bounds<Pixels>) {
-        self.platform_window.set_bounds(bounds);
     }
 
     /// Returns whether or not the window is currently fullscreen
@@ -3126,7 +3122,7 @@ impl Window {
         f: impl FnOnce(&GlobalElementId, &mut Self) -> R,
     ) -> R {
         self.with_id(element_id, |this| {
-            let global_id = GlobalElementId(Arc::from(&*this.element_id_stack));
+            let global_id = this.element_id_stack.global_id();
 
             f(&global_id, this)
         })
@@ -3559,16 +3555,18 @@ impl Window {
         self.refreshing = false;
         self.invalidator.set_phase(DrawPhase::None);
         // Focus listeners may move focus (e.g. a dock forwarding focus to its active
-        // panel). `Window::focus` suppresses its invalidation while a draw is in progress, so
+        // panel). `Window::focus` suppresses `refresh` while a draw is in progress, so
         // schedule another frame here to render the new focus state and dispatch the
         // resulting focus events.
         if self.focus != focus_before_listeners {
-            self.invalidate_focus_move(focus_before_listeners, self.focus);
+            self.refresh();
         }
         self.needs_present.set(true);
 
         #[cfg(feature = "profiler")]
         {
+            self.window_profiler
+                .set_refresh_interval(self.refresh_interval(cx));
             let draw_duration = self
                 .window_profiler
                 .end_draw(frame_dirty.dirty_at, frame_dirty.invalidations);
@@ -3671,8 +3669,6 @@ impl Window {
     fn draw_roots(&mut self, cx: &mut App) {
         self.invalidator.set_phase(DrawPhase::Prepaint);
         self.tooltip_bounds.take();
-        // a panic caught mid-round must not parent this frame's root draws to a dead index
-        self.prepainting_draw = None;
 
         self.a11y.sync_active_flag();
         if self.a11y.is_active() {
@@ -3701,8 +3697,12 @@ impl Window {
         // stretches to fill the viewport unless explicitly sized, window roots
         // fill the window when their size is `auto`.
         let scale_factor = self.scale_factor();
+        #[cfg(feature = "profiler")]
+        let request_layout_start = Instant::now();
         let mut root_element = self.root.as_ref().unwrap().clone().into_any_element();
         let root_layout_id = root_element.request_layout(self, cx);
+        #[cfg(feature = "profiler")]
+        let prepaint_start = Instant::now();
         self.layout_engine
             .as_mut()
             .unwrap()
@@ -3712,10 +3712,11 @@ impl Window {
         #[cfg(any(feature = "inspector", debug_assertions))]
         let inspector_element = self.prepaint_inspector(_inspector_width, cx);
 
-        self.prepaint_deferred_draws(0, cx);
+        self.prepaint_deferred_draws(cx);
 
         let mut prompt_element = None;
         let mut active_drag_element = None;
+        let mut tooltip_element = None;
         if let Some(prompt) = self.prompt.take() {
             let mut element = prompt.view.any_view().into_any_element();
             let prompt_layout_id = element.request_layout(self, cx);
@@ -3733,12 +3734,14 @@ impl Window {
             active_drag_element = Some(element);
             cx.active_drag = Some(active_drag);
         } else {
-            self.prepaint_tooltip(cx);
+            tooltip_element = self.prepaint_tooltip(cx);
         }
 
         self.mouse_hit_test = self.next_frame.hit_test(self.mouse_position);
 
         // Now actually paint the elements.
+        #[cfg(feature = "profiler")]
+        let paint_start = Instant::now();
         self.invalidator.set_phase(DrawPhase::Paint);
         root_element.paint(self, cx);
 
@@ -3751,10 +3754,20 @@ impl Window {
             prompt_element.paint(self, cx);
         } else if let Some(mut drag_element) = active_drag_element {
             drag_element.paint(self, cx);
+        } else if let Some(mut tooltip_element) = tooltip_element {
+            tooltip_element.paint(self, cx);
         }
 
         #[cfg(any(feature = "inspector", debug_assertions))]
         self.paint_inspector_hitbox(cx);
+
+        #[cfg(feature = "profiler")]
+        self.window_profiler
+            .record_draw_phases(profiler::DrawPhases {
+                request_layout: prepaint_start.duration_since(request_layout_start),
+                prepaint: paint_start.duration_since(prepaint_start),
+                paint: Instant::now().duration_since(paint_start),
+            });
 
         // a11y may have been activated/deactivated halfway through the frame
         let a11y_active_start_of_frame = self.a11y.is_active();
@@ -3773,7 +3786,6 @@ impl Window {
             };
             // clear the builder state regardless
             let tree_update = self.a11y.end_frame(frame_info);
-            self.a11y.rendered.built = true;
 
             if should_send_a11y_update {
                 log::debug!(
@@ -3782,14 +3794,10 @@ impl Window {
                 );
                 self.platform_window.a11y_tree_update(tree_update);
             }
-        } else {
-            self.a11y.rendered.built = false;
         }
     }
 
-    /// Prepaints the topmost visible tooltip as a deferred draw: in its [`TooltipLayer`], or
-    /// above every other deferred draw, unclipped, when it has none.
-    fn prepaint_tooltip(&mut self, cx: &mut App) {
+    fn prepaint_tooltip(&mut self, cx: &mut App) -> Option<AnyElement> {
         // Use indexing instead of iteration to avoid borrowing self for the duration of the loop.
         for tooltip_request_index in (0..self.next_frame.tooltip_requests.len()).rev() {
             let Some(Some(tooltip_request)) = self
@@ -3811,32 +3819,27 @@ impl Window {
                 origin: Point::default(),
                 size: self.viewport_size(),
             };
-            // A layered tooltip fits inside its layer's mask.
-            let limits = match tooltip_request.layer {
-                Some(layer) => layer.mask.bounds.intersect(&window_bounds),
-                None => window_bounds,
-            };
 
-            if tooltip_bounds.right() > limits.right() {
+            if tooltip_bounds.right() > window_bounds.right() {
                 let new_x = mouse_position.x - tooltip_bounds.size.width - px(1.);
-                if new_x >= limits.left() {
+                if new_x >= Pixels::ZERO {
                     tooltip_bounds.origin.x = new_x;
                 } else {
                     tooltip_bounds.origin.x = cmp::max(
-                        limits.left(),
-                        tooltip_bounds.origin.x - tooltip_bounds.right() - limits.right(),
+                        Pixels::ZERO,
+                        tooltip_bounds.origin.x - tooltip_bounds.right() - window_bounds.right(),
                     );
                 }
             }
 
-            if tooltip_bounds.bottom() > limits.bottom() {
+            if tooltip_bounds.bottom() > window_bounds.bottom() {
                 let new_y = mouse_position.y - tooltip_bounds.size.height - px(1.);
-                if new_y >= limits.top() {
+                if new_y >= Pixels::ZERO {
                     tooltip_bounds.origin.y = new_y;
                 } else {
                     tooltip_bounds.origin.y = cmp::max(
-                        limits.top(),
-                        tooltip_bounds.origin.y - tooltip_bounds.bottom() - limits.bottom(),
+                        Pixels::ZERO,
+                        tooltip_bounds.origin.y - tooltip_bounds.bottom() - window_bounds.bottom(),
                     );
                 }
             }
@@ -3850,36 +3853,20 @@ impl Window {
                 continue;
             }
 
-            let (priority, content_mask) = match tooltip_request.layer {
-                Some(layer) => (layer.priority, Some(layer.mask)),
-                None => (usize::MAX, None),
-            };
-            let deferred_start = self.next_frame.deferred_draws.len();
-            let root_node = self.next_frame.dispatch_tree.root_node_id();
-            self.next_frame.dispatch_tree.set_active_node(root_node);
-            // a layered tooltip draws inside the draw its source was drawn in
-            let outer = mem::replace(
-                &mut self.prepainting_draw,
-                tooltip_request.layer.and(tooltip_request.parent),
-            );
-            self.with_tooltip_layer(tooltip_request.layer, |window| {
-                window.with_rendered_view(tooltip_request.tooltip.view.entity_id(), |window| {
-                    window.defer_draw(element, tooltip_bounds.origin, priority, content_mask)
-                })
+            self.with_absolute_element_offset(tooltip_bounds.origin, |window| {
+                element.prepaint(window, cx)
             });
-            self.prepainting_draw = outer;
-            self.prepaint_deferred_draws(deferred_start, cx);
 
             self.tooltip_bounds = Some(TooltipBounds {
                 id: tooltip_request.id,
                 bounds: tooltip_bounds,
             });
-            return;
+            return Some(element);
         }
+        None
     }
 
-    /// Prepaints the deferred draws from index `from` on, round by round.
-    fn prepaint_deferred_draws(&mut self, from: usize, cx: &mut App) {
+    fn prepaint_deferred_draws(&mut self, cx: &mut App) {
         assert_eq!(self.element_id_stack.len(), 0);
 
         // Process deferred draws in multiple rounds to support nesting.
@@ -3892,7 +3879,7 @@ impl Window {
         // slices on the next frame. Moving the draws out and re-appending them
         // shifts the indices of nested draws, causing reused subtrees to graft
         // the wrong deferred draws and panic in the dispatch tree.
-        let mut round_start = from;
+        let mut round_start = 0;
         let mut depth = 0;
         loop {
             let round_end = self.next_frame.deferred_draws.len();
@@ -3908,17 +3895,7 @@ impl Window {
             traversal_order.sort_by_key(|ix| self.next_frame.deferred_draws[*ix].priority);
 
             for deferred_draw_ix in traversal_order {
-                let (
-                    element,
-                    parent_node,
-                    a11y_parent,
-                    current_view,
-                    rem_size,
-                    absolute_offset,
-                    content_mask,
-                    tooltip_layer,
-                    prepaint_range,
-                ) = {
+                let (element, parent_node, current_view, rem_size, absolute_offset, prepaint_range) = {
                     let deferred_draw = &mut self.next_frame.deferred_draws[deferred_draw_ix];
                     self.element_id_stack
                         .clone_from(&deferred_draw.element_id_stack);
@@ -3927,33 +3904,20 @@ impl Window {
                     (
                         deferred_draw.element.take(),
                         deferred_draw.parent_node,
-                        deferred_draw.a11y_parent,
                         deferred_draw.current_view,
                         deferred_draw.rem_size,
                         deferred_draw.absolute_offset,
-                        deferred_draw.content_mask,
-                        deferred_draw.tooltip_layer,
                         deferred_draw.prepaint_range.clone(),
                     )
                 };
                 self.next_frame.dispatch_tree.set_active_node(parent_node);
-                let reopened = self.a11y.is_active()
-                    && a11y_parent.is_some_and(|parent| self.a11y.nodes.reopen(parent));
 
-                let outer = self.prepainting_draw.replace(deferred_draw_ix);
                 let prepaint_start = self.prepaint_index();
                 if let Some(mut element) = element {
                     self.with_rendered_view(current_view, |window| {
-                        window.with_content_mask(content_mask, |window| {
-                            window.with_tooltip_layer(tooltip_layer, |window| {
-                                window.with_rem_size(Some(rem_size), |window| {
-                                    window.with_absolute_element_offset(
-                                        absolute_offset,
-                                        |window| {
-                                            element.prepaint(window, cx);
-                                        },
-                                    );
-                                });
+                        window.with_rem_size(Some(rem_size), |window| {
+                            window.with_absolute_element_offset(absolute_offset, |window| {
+                                element.prepaint(window, cx);
                             });
                         });
                     });
@@ -3961,10 +3925,6 @@ impl Window {
                 } else {
                     self.reuse_prepaint(prepaint_range);
                 }
-                if reopened {
-                    self.a11y.nodes.close_reopened();
-                }
-                self.prepainting_draw = outer;
                 let prepaint_end = self.prepaint_index();
                 self.next_frame.deferred_draws[deferred_draw_ix].prepaint_range =
                     prepaint_start..prepaint_end;
@@ -3985,7 +3945,7 @@ impl Window {
             return;
         }
 
-        let traversal_order = self.next_frame.deferred_draw_traversal_order();
+        let traversal_order = self.deferred_draw_traversal_order();
         let mut deferred_draws = mem::take(&mut self.next_frame.deferred_draws);
         for deferred_draw_ix in traversal_order {
             let mut deferred_draw = &mut deferred_draws[deferred_draw_ix];
@@ -4015,6 +3975,13 @@ impl Window {
         self.element_id_stack.clear();
     }
 
+    fn deferred_draw_traversal_order(&mut self) -> SmallVec<[usize; 8]> {
+        let deferred_count = self.next_frame.deferred_draws.len();
+        let mut sorted_indices = (0..deferred_count).collect::<SmallVec<[_; 8]>>();
+        sorted_indices.sort_by_key(|ix| self.next_frame.deferred_draws[*ix].priority);
+        sorted_indices
+    }
+
     pub(crate) fn prepaint_index(&self) -> PrepaintStateIndex {
         PrepaintStateIndex {
             hitboxes_index: self.next_frame.hitboxes.len(),
@@ -4023,7 +3990,6 @@ impl Window {
             dispatch_tree_index: self.next_frame.dispatch_tree.len(),
             accessed_element_states_index: self.next_frame.accessed_element_states.len(),
             line_layout_index: self.text_system.layout_index(),
-            a11y_index: self.a11y.nodes.log_len(),
         }
     }
 
@@ -4033,18 +3999,11 @@ impl Window {
                 .iter()
                 .cloned(),
         );
-        // Replayed draws and tooltips sit inside the draw replaying them now, never inside last
-        // frame's index.
-        let parent = self.prepainting_draw;
         self.next_frame.tooltip_requests.extend(
             self.rendered_frame.tooltip_requests
                 [range.start.tooltips_index..range.end.tooltips_index]
                 .iter_mut()
-                .map(|request| {
-                    request
-                        .take()
-                        .map(|request| TooltipRequest { parent, ..request })
-                }),
+                .map(|request| request.take()),
         );
         self.next_frame.accessed_element_states.extend(
             self.rendered_frame.accessed_element_states[range.start.accessed_element_states_index
@@ -4065,30 +4024,16 @@ impl Window {
             self.next_frame.focus = self.focus;
         }
 
-        // The rendered frame built its tree with accessibility on, so the
-        // range's nodes are in its log; a frame drawn without it leaves the
-        // cached view's nodes out, as before, until the refresh that follows
-        // activation renders it again.
-        if self.a11y.is_active() && self.a11y.rendered.built {
-            self.a11y.reuse_range(
-                range.start.a11y_index..range.end.a11y_index,
-                reused_subtree.contains_focus(),
-            );
-        }
-
         self.next_frame.deferred_draws.extend(
             self.rendered_frame.deferred_draws
                 [range.start.deferred_draws_index..range.end.deferred_draws_index]
                 .iter()
                 .map(|deferred_draw| DeferredDraw {
                     current_view: deferred_draw.current_view,
-                    parent,
                     parent_node: reused_subtree.refresh_node_id(deferred_draw.parent_node),
-                    a11y_parent: deferred_draw.a11y_parent,
                     element_id_stack: deferred_draw.element_id_stack.clone(),
                     text_style_stack: deferred_draw.text_style_stack.clone(),
                     content_mask: deferred_draw.content_mask,
-                    tooltip_layer: deferred_draw.tooltip_layer,
                     rem_size: deferred_draw.rem_size,
                     priority: deferred_draw.priority,
                     element: None,
@@ -4199,45 +4144,15 @@ impl Window {
         })
     }
 
-    /// Sets a tooltip to be rendered for the upcoming frame, in the current
-    /// [`TooltipLayer`] if any. This method should only be called during the paint phase of
-    /// element drawing.
+    /// Sets a tooltip to be rendered for the upcoming frame. This method should only be called
+    /// during the paint phase of element drawing.
     pub fn set_tooltip(&mut self, tooltip: AnyTooltip) -> TooltipId {
         self.invalidator.debug_assert_prepaint();
         let id = TooltipId(post_inc(&mut self.next_tooltip_id.0));
-        self.next_frame.tooltip_requests.push(Some(TooltipRequest {
-            id,
-            tooltip,
-            layer: self.tooltip_layer,
-            parent: self.prepainting_draw,
-        }));
+        self.next_frame
+            .tooltip_requests
+            .push(Some(TooltipRequest { id, tooltip }));
         id
-    }
-
-    /// Invoke the given function with the given tooltip layer: every tooltip registered inside
-    /// it, and inside the deferred draws it registers, draws in that layer (see [`TooltipLayer`]).
-    /// `None` keeps the current layer. This method should only be called during the prepaint
-    /// phase of element drawing.
-    pub fn with_tooltip_layer<R>(
-        &mut self,
-        layer: Option<TooltipLayer>,
-        f: impl FnOnce(&mut Self) -> R,
-    ) -> R {
-        self.invalidator.debug_assert_prepaint();
-        let Some(layer) = layer else {
-            return f(self);
-        };
-        let previous = self.tooltip_layer.replace(layer);
-        let result = f(self);
-        self.tooltip_layer = previous;
-        result
-    }
-
-    /// The tooltip layer in effect, if any. This method should only be called during the prepaint
-    /// phase of element drawing.
-    pub fn tooltip_layer(&self) -> Option<TooltipLayer> {
-        self.invalidator.debug_assert_prepaint();
-        self.tooltip_layer
     }
 
     /// Invoke the given function with the given content mask after intersecting it
@@ -4579,9 +4494,8 @@ impl Window {
     }
 
     /// Defers the drawing of the given element, scheduling it to be painted on top of the currently-drawn tree
-    /// at a later time. The `priority` parameter determines the drawing order relative to other deferred elements
-    /// made in the same deferred draw (or at the root), with higher values being drawn on top; a draw made while
-    /// another prepaints draws inside it, right after it.
+    /// at a later time. The `priority` parameter determines the drawing order relative to other deferred elements,
+    /// with higher values being drawn on top.
     ///
     /// When `content_mask` is provided, the deferred element will be clipped to that region during
     /// both prepaint and paint. When `None`, no additional clipping is applied.
@@ -4598,13 +4512,10 @@ impl Window {
         let parent_node = self.next_frame.dispatch_tree.active_node_id().unwrap();
         self.next_frame.deferred_draws.push(DeferredDraw {
             current_view: self.current_view(),
-            parent: self.prepainting_draw,
             parent_node,
-            a11y_parent: self.a11y.nodes.head().filter(|_| self.a11y.is_active()),
             element_id_stack: self.element_id_stack.clone(),
             text_style_stack: self.text_style_stack.clone(),
             content_mask,
-            tooltip_layer: self.tooltip_layer,
             rem_size: self.rem_size(),
             priority,
             element: Some(element),
@@ -5066,17 +4977,6 @@ impl Window {
         Ok(())
     }
 
-    /// The sprite atlas key [`Window::paint_svg`] rasterises `path` under when it paints it in
-    /// `bounds` in this window. [`Window::drop_svg`] takes that raster out of the atlas again.
-    pub fn svg_params(&self, bounds: Bounds<Pixels>, path: SharedString) -> RenderSvgParams {
-        RenderSvgParams {
-            path,
-            size: self.snap_bounds(bounds).size.map(|pixels| {
-                DevicePixels::from((pixels.0 * SMOOTH_SVG_SCALE_FACTOR).ceil() as i32)
-            }),
-        }
-    }
-
     /// Paint a monochrome SVG into the scene for the next frame at the current stacking context.
     ///
     /// This method should only be called as part of the paint phase of element drawing.
@@ -5092,8 +4992,14 @@ impl Window {
         self.invalidator.debug_assert_paint();
 
         let element_opacity = self.element_opacity();
-        let params = self.svg_params(bounds, path);
         let bounds = self.snap_bounds(bounds);
+
+        let params = RenderSvgParams {
+            path,
+            size: bounds.size.map(|pixels| {
+                DevicePixels::from((pixels.0 * SMOOTH_SVG_SCALE_FACTOR).ceil() as i32)
+            }),
+        };
 
         let Some(tile) =
             self.sprite_atlas
@@ -5246,7 +5152,11 @@ impl Window {
     ///
     /// This method should only be called as part of the paint phase of element drawing.
     #[cfg(any(target_os = "macos", target_os = "ios"))]
-    pub fn paint_surface(&mut self, bounds: Bounds<Pixels>, image_buffer: CVPixelBuffer) {
+    pub fn paint_surface(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        image_buffer: CFRetained<CVPixelBuffer>,
+    ) {
         use crate::PaintSurface;
 
         self.invalidator.debug_assert_paint();
@@ -5275,11 +5185,6 @@ impl Window {
         Ok(())
     }
 
-    /// Removes an SVG raster from the sprite atlas: the one [`Window::svg_params`] names.
-    pub fn drop_svg(&mut self, params: RenderSvgParams) {
-        self.sprite_atlas.remove(&params.into());
-    }
-
     /// Returns whether every frame of an image is present in the sprite atlas.
     #[cfg(any(test, feature = "test-support"))]
     pub fn has_image_atlas_entry(&self, data: &RenderImage) -> bool {
@@ -5293,12 +5198,6 @@ impl Window {
                     .into(),
                 )
             })
-    }
-
-    /// Returns whether an SVG raster is present in the sprite atlas.
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn has_svg_atlas_entry(&self, params: &RenderSvgParams) -> bool {
-        self.sprite_atlas.contains(&params.clone().into())
     }
 
     /// Add a node to the layout tree for the current frame. Takes the `Style` of the element for which
@@ -5446,13 +5345,6 @@ impl Window {
     pub fn set_view_id(&mut self, view_id: EntityId) {
         self.invalidator.debug_assert_prepaint();
         self.next_frame.dispatch_tree.set_view_id(view_id);
-    }
-
-    /// Notes that the current element styles itself by `in_focus`, so a focus
-    /// move onto or off one of its ancestors redraws the view that rendered it.
-    pub(crate) fn set_in_focus_reader(&mut self) {
-        self.invalidator.debug_assert_prepaint();
-        self.next_frame.dispatch_tree.set_in_focus_reader();
     }
 
     /// Get the entity ID for the currently rendering view
@@ -7115,62 +7007,9 @@ impl Window {
         self.a11y.is_active()
     }
 
-    /// Builds this window's accessibility tree from the next frame on, as if
-    /// assistive technology had connected, and forces that frame.
-    ///
-    /// Tests use this to inspect the tree with no adapter attached. It has no
-    /// effect on an [inaccessible](crate::Application::new_inaccessible)
-    /// application. An adapter's deactivation turns it off again.
-    pub fn activate_a11y(&mut self) {
-        self.a11y.activate();
-        self.refresh();
-    }
-
     /// Debug representation of the last frame's accessibility information.
     pub fn debug_a11y_tree_json(&self) -> Option<String> {
         self.a11y.debug_tree_json()
-    }
-
-    /// The whole accessibility tree this window built on its last frame with
-    /// accessibility active (see [`Self::activate_a11y`]), or `None` before one.
-    /// Each update GPUI sends carries the whole tree, so this is the current tree.
-    pub fn a11y_tree(&self) -> Option<&accesskit::TreeUpdate> {
-        self.a11y.last_tree_update()
-    }
-
-    /// The element that built `node` on the last frame with accessibility
-    /// active; `None` for the root and for synthetic children.
-    pub fn a11y_element_id(&self, node: accesskit::NodeId) -> Option<&GlobalElementId> {
-        self.a11y.element_ids.get(&node)
-    }
-
-    /// The elements whose accessibility node the last frame with accessibility
-    /// active refused, each with the node id it shared with an earlier node,
-    /// in paint order. Such a node is left out of the tree.
-    ///
-    /// In a debug build a duplicate pushed live panics first, so only
-    /// duplicates skipped while replaying a cached view are listed there.
-    /// The list is not replayed: a refusal inside a cached view is listed only
-    /// on frames that render the view live, though its node stays left out.
-    pub fn a11y_refused_elements(&self) -> &[(accesskit::NodeId, GlobalElementId)] {
-        self.a11y.refused_elements()
-    }
-
-    /// Performs an accessibility action as if an adapter had requested it:
-    /// the node's own listener if it has one (a div's click listeners answer
-    /// its Click), else GPUI's built-in handling (Click synthesized at the
-    /// node's centre, Focus, Blur).
-    #[cfg(not(target_family = "wasm"))]
-    pub fn dispatch_a11y_action(&mut self, request: accesskit::ActionRequest, cx: &mut App) {
-        self.handle_a11y_action(request, cx);
-    }
-
-    /// The last accessibility tree update this window sent to its test
-    /// platform window, or `None` on other platforms or before the first
-    /// frame built with accessibility active.
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn last_a11y_tree_update(&mut self) -> Option<accesskit::TreeUpdate> {
-        self.platform_window.as_test()?.last_a11y_tree_update()
     }
 
     /// Register a listener for an accessibility action on a specific node.
@@ -8251,6 +8090,118 @@ mod tests {
             .update(cx, |_, window, _| assert!(window.is_visible()))
             .unwrap();
         assert_eq!(test_window.frame_wake_count(), frame_wake_count);
+    }
+
+    /// App learns display state from the platform's display notifications,
+    /// and a window from the platform's report of which display it is on.
+    #[gpui::test]
+    fn test_display_tracking(cx: &mut TestAppContext) {
+        use crate::{DisplayChanges, DisplayEvent, DisplayId, Subscription};
+
+        let sixty_hertz = Duration::from_secs(1) / 60;
+        let one_hundred_twenty_hertz = Duration::from_secs(1) / 120;
+        let one_hundred_forty_four_hertz = Duration::from_secs(1) / 144;
+
+        let display_events = Rc::new(RefCell::new(Vec::new()));
+        let _display_subscription = cx.update({
+            let display_events = display_events.clone();
+            move |cx| cx.observe_displays(move |event, _| display_events.borrow_mut().push(event))
+        });
+
+        let window = cx.add_window(|window, cx| DisplayTracker {
+            refresh_intervals: Vec::new(),
+            _subscription: cx.observe_window_display(
+                window,
+                |tracker: &mut DisplayTracker, window, cx| {
+                    tracker.refresh_intervals.push(window.refresh_interval(cx));
+                },
+            ),
+        });
+        let window_notifications = Rc::new(RefCell::new(Vec::new()));
+        let _window_subscription = window
+            .update(cx, {
+                let window_notifications = window_notifications.clone();
+                move |_, window, cx| {
+                    assert_eq!(window.refresh_interval(cx), Some(sixty_hertz));
+                    window.observe_window_display(move |window, cx| {
+                        window_notifications
+                            .borrow_mut()
+                            .push((window.display_id, window.refresh_interval(cx)));
+                    })
+                }
+            })
+            .unwrap();
+        let test_window = cx.test_window(window.into());
+
+        // The window may hear that it moved before App hears the display was
+        // connected. App learns about the display before the window's
+        // observers run, and the platform's later notification changes
+        // nothing.
+        cx.test_platform()
+            .connect_display(DisplayId(2), Some(one_hundred_twenty_hertz));
+        test_window.simulate_move_to_display(DisplayId(2));
+        assert_eq!(
+            window_notifications.take(),
+            [(Some(DisplayId(2)), Some(one_hundred_twenty_hertz))]
+        );
+        assert_eq!(display_events.take(), [DisplayEvent::Added(DisplayId(2))]);
+        cx.simulate_display_refresh_interval_change(DisplayId(2), Some(one_hundred_twenty_hertz));
+        assert!(window_notifications.borrow().is_empty());
+
+        // Platforms may report a move that isn't one.
+        test_window.simulate_move_to_display(DisplayId(2));
+        assert!(window_notifications.borrow().is_empty());
+
+        cx.simulate_display_refresh_interval_change(
+            DisplayId(2),
+            Some(one_hundred_forty_four_hertz),
+        );
+        assert_eq!(
+            window_notifications.take(),
+            [(Some(DisplayId(2)), Some(one_hundred_forty_four_hertz))]
+        );
+
+        // Changes to a display the window isn't on don't notify it.
+        cx.simulate_display_refresh_interval_change(DisplayId(1), Some(one_hundred_twenty_hertz));
+        cx.simulate_display_removed(DisplayId(1));
+        assert!(window_notifications.borrow().is_empty());
+
+        assert_eq!(
+            display_events.take(),
+            [
+                DisplayEvent::Changed {
+                    id: DisplayId(2),
+                    changes: DisplayChanges::REFRESH_INTERVAL,
+                },
+                DisplayEvent::Changed {
+                    id: DisplayId(1),
+                    changes: DisplayChanges::REFRESH_INTERVAL,
+                },
+                DisplayEvent::Removed(DisplayId(1)),
+            ]
+        );
+        window
+            .update(cx, |tracker, _, _| {
+                assert_eq!(
+                    tracker.refresh_intervals,
+                    [
+                        Some(one_hundred_twenty_hertz),
+                        Some(one_hundred_forty_four_hertz)
+                    ]
+                );
+            })
+            .unwrap();
+
+        struct DisplayTracker {
+            refresh_intervals: Vec<Option<Duration>>,
+            _subscription: Subscription,
+        }
+
+        impl Render for DisplayTracker {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                Empty
+            }
+        }
     }
 
     #[gpui::test]
@@ -9661,112 +9612,6 @@ mod tests {
                 );
             })
             .unwrap();
-    }
-
-    /// A painted SVG's raster stays in the window's atlas until `drop_svg` names it by
-    /// `svg_params`, for a path and for data alike, and the next paint rasterises it again.
-    #[gpui::test]
-    fn a_dropped_svg_leaves_the_atlas_and_the_next_paint_rasterises_it(cx: &mut TestAppContext) {
-        use crate::{AssetSource, SharedString, Svg, SvgRenderer, black, svg};
-        use std::{
-            borrow::Cow,
-            sync::{
-                Arc,
-                atomic::{AtomicUsize, Ordering::SeqCst},
-            },
-        };
-
-        const ICON: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="4" height="3"><path d="M0 0h4v3H0z"/></svg>"#;
-
-        struct CountedIcon(Arc<AtomicUsize>);
-
-        impl AssetSource for CountedIcon {
-            fn load(&self, _: &str) -> anyhow::Result<Option<Cow<'static, [u8]>>> {
-                self.0.fetch_add(1, SeqCst);
-                Ok(Some(Cow::Borrowed(ICON)))
-            }
-
-            fn list(&self, _: &str) -> anyhow::Result<Vec<SharedString>> {
-                Ok(Vec::new())
-            }
-        }
-
-        struct Icons;
-
-        impl Render for Icons {
-            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-                div()
-                    .size_full()
-                    .child(
-                        svg()
-                            .path("icon.svg")
-                            .absolute()
-                            .left(px(10.))
-                            .top(px(2.))
-                            .size(px(16.))
-                            .text_color(black()),
-                    )
-                    .child(
-                        svg()
-                            .data(ICON)
-                            .absolute()
-                            .left(px(40.))
-                            .top(px(2.))
-                            .w(px(12.))
-                            .h(px(9.))
-                            .text_color(black()),
-                    )
-            }
-        }
-
-        let loads = Arc::new(AtomicUsize::new(0));
-        cx.update(|cx| cx.svg_renderer = SvgRenderer::new(Arc::new(CountedIcon(loads.clone()))));
-        let window = cx.add_window(|_, _| Icons);
-        cx.update_window(window.into(), |_, window, cx| {
-            let keys = [
-                window.svg_params(
-                    Bounds::new(point(px(10.), px(2.)), size(px(16.), px(16.))),
-                    "icon.svg".into(),
-                ),
-                window.svg_params(
-                    Bounds::new(point(px(40.), px(2.)), size(px(12.), px(9.))),
-                    Svg::data_path(ICON),
-                ),
-            ];
-            window.draw(cx).clear(cx);
-            for key in &keys {
-                assert!(
-                    window.has_svg_atlas_entry(key),
-                    "{} is in the atlas",
-                    key.path
-                );
-            }
-            let loads_painted = loads.load(SeqCst);
-
-            for key in &keys {
-                window.drop_svg(key.clone());
-                assert!(
-                    !window.has_svg_atlas_entry(key),
-                    "{} left the atlas",
-                    key.path
-                );
-            }
-
-            window.draw(cx).clear(cx);
-            for key in &keys {
-                assert!(
-                    window.has_svg_atlas_entry(key),
-                    "{} was rasterised again",
-                    key.path
-                );
-            }
-            assert_eq!(
-                loads.load(SeqCst),
-                loads_painted + 1,
-                "the path SVG was read again to rasterise it"
-            );
-        })
-        .unwrap();
     }
 }
 

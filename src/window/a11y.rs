@@ -64,11 +64,6 @@
 //! a frame have been prepainted, we send the resulting [`TreeUpdate`] object to
 //! the adapter and the screen reader can announce the changes.
 //!
-//! A deferred draw prepaints after everything drawn in place, when the node it
-//! was drawn in is already finished. It records that node at registration and
-//! [reopens](A11yNodeBuilder::reopen) it, so its nodes are that node's
-//! children, not the window's.
-//!
 //! #### Synthetic children
 //!
 //! Additionally, some nodes can register "synthetic children" using
@@ -112,8 +107,6 @@ use accesskit::{Action, NodeId, TreeUpdate};
 use collections::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 use std::hash::{Hash, Hasher};
-use std::mem;
-use std::ops::Range;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -125,29 +118,6 @@ pub(crate) const ROOT_NODE_ID: NodeId = NodeId(0);
 /// A listener for an accessibility action on a specific node.
 pub(crate) type A11yActionListener =
     Box<dyn FnMut(Option<&accesskit::ActionData>, &mut Window, &mut App) + 'static>;
-
-/// What the last drawn frame built, kept for cache reuse.
-///
-/// [`A11y::begin_frame`] moves the live per-frame maps here at the start of
-/// the next frame (not at its end: the live maps are read between frames by
-/// [`crate::Window::a11y_element_id`] and action dispatch). A cached view
-/// whose prepaint is reused copies its nodes and side entries back out of
-/// here by log range, see [`A11y::reuse_range`].
-#[derive(Default)]
-pub(crate) struct RenderedA11y {
-    /// `(parent, id, node)` in pop order, as [`A11yNodeBuilder::log`].
-    log: Vec<(NodeId, NodeId, accesskit::Node)>,
-    focus_ids: FxHashMap<NodeId, FocusId>,
-    node_bounds: FxHashMap<NodeId, Bounds<Pixels>>,
-    element_ids: FxHashMap<NodeId, GlobalElementId>,
-    action_listeners: FxHashMap<NodeId, Vec<(Action, A11yActionListener)>>,
-    focus: Option<NodeId>,
-    /// Every active-descendant claim made, as [`A11y::claims`].
-    claims: Vec<(NodeId, Option<NodeId>)>,
-    /// The previous draw ran `begin_frame` and `end_frame`, so `log` is the
-    /// tree the prepaint ranges of that frame index into.
-    pub(crate) built: bool,
-}
 
 /// Per-window accessibility state.
 ///
@@ -178,19 +148,7 @@ pub(crate) struct A11y {
     pub(crate) nodes: A11yNodeBuilder,
     pub(crate) focus_ids: FxHashMap<NodeId, FocusId>,
     pub(crate) node_bounds: FxHashMap<NodeId, Bounds<Pixels>>,
-    /// The element each node of this frame was built from, so a tool can
-    /// name a node by its element path rather than its hashed [`NodeId`].
-    pub(crate) element_ids: FxHashMap<NodeId, GlobalElementId>,
-    /// The elements whose node this frame refused because an earlier node
-    /// already had the same id, in paint order.
-    refused: Vec<(NodeId, GlobalElementId)>,
     pub(crate) action_listeners: FxHashMap<NodeId, Vec<(Action, A11yActionListener)>>,
-    /// Every active-descendant claim made this frame, honored or not, with
-    /// its gate: the claimant's nearest focusable ancestor, whose focus
-    /// decides the claim. A reused range judges its claims again by the
-    /// current frame's focus (see [`Self::reuse_range`]).
-    claims: Vec<(NodeId, Option<NodeId>)>,
-    pub(crate) rendered: RenderedA11y,
     /// The window's title, used to label the root node so assistive
     /// technology can tell windows apart.
     window_title: Option<SharedString>,
@@ -218,11 +176,7 @@ impl A11y {
             nodes: A11yNodeBuilder::new(),
             focus_ids: FxHashMap::default(),
             node_bounds: FxHashMap::default(),
-            element_ids: FxHashMap::default(),
-            refused: Vec::new(),
             action_listeners: FxHashMap::default(),
-            claims: Vec::new(),
-            rendered: RenderedA11y::default(),
             window_title,
             last_focus_without_node: None,
             debug: debug::A11yDebug::default(),
@@ -265,11 +219,6 @@ impl A11y {
 
     pub(crate) fn is_active(&self) -> bool {
         self.active_this_frame
-    }
-
-    /// Marks accessibility as requested, as an adapter's activation does.
-    pub(crate) fn activate(&self) {
-        self.active_flag.store(true, Ordering::SeqCst);
     }
 
     pub(crate) fn set_focusable(&mut self, node_id: NodeId, focus_id: FocusId) {
@@ -317,141 +266,17 @@ impl A11y {
             }
             return;
         }
-        if self.nodes.has_node(node_id) {
-            let gate = self.nodes.nearest_focusable_ancestor(&self.focus_ids);
-            self.claims.push((node_id, gate));
-            if gate.is_some() && gate == self.nodes.focus {
-                self.nodes.set_active_descendant(node_id);
-            }
+        if self.nodes.has_node(node_id) && self.nodes.focus_is_ancestor_of_current() {
+            self.nodes.set_active_descendant(node_id);
         }
     }
 
-    /// Push the node of `element` onto the tree, remembering the element for
-    /// [`Window::a11y_element_id`] or, when the id is taken, for
-    /// [`Window::a11y_refused_elements`].
-    ///
-    /// Returns `true` if the node was pushed.
-    pub(crate) fn push_element(
-        &mut self,
-        node_id: NodeId,
-        node: accesskit::Node,
-        element: &GlobalElementId,
-    ) -> bool {
-        let pushed = self.nodes.push(node_id, node);
-        if pushed {
-            self.element_ids.insert(node_id, element.clone());
-        } else {
-            self.refused.push((node_id, element.clone()));
-        }
-        pushed
-    }
-
-    pub(crate) fn refused_elements(&self) -> &[(NodeId, GlobalElementId)] {
-        &self.refused
-    }
-
-    /// Hand the last frame's state to [`Self::rendered`], clear the rest and
-    /// push the root node to start a new frame.
+    /// Clear per-frame state and push the root node to start a new frame.
     pub(crate) fn begin_frame(&mut self) {
-        self.rendered.focus_ids = mem::take(&mut self.focus_ids);
-        self.rendered.node_bounds = mem::take(&mut self.node_bounds);
-        self.rendered.element_ids = mem::take(&mut self.element_ids);
-        self.rendered.action_listeners = mem::take(&mut self.action_listeners);
-        self.rendered.log = mem::take(&mut self.nodes.log);
-        self.rendered.focus = self.nodes.focus;
-        self.rendered.claims = mem::take(&mut self.claims);
-        self.refused.clear();
+        self.focus_ids.clear();
+        self.node_bounds.clear();
+        self.action_listeners.clear();
         self.nodes.begin_frame(self.window_title.as_ref());
-    }
-
-    /// Replay the nodes a reused prepaint built last frame: `range` indexes
-    /// [`RenderedA11y::log`]. Nodes whose parent lies outside the range become
-    /// children of the current top-of-stack node; the side maps are copied and
-    /// the action listeners moved for every node replayed. `contains_focus`
-    /// (the reused dispatch subtree's) carries the focused node over.
-    ///
-    /// The log is in pop order (children first), so it is walked in reverse
-    /// and a node is replayed only when its parent was: a duplicate id (an
-    /// element that moved between a cached and an uncached parent this frame)
-    /// is left out with its subtree and recorded as refused, as a refused push
-    /// is, never grafted as an orphan, and its replayed parent no longer lists
-    /// it. Bounds need no re-mapping: the cache key demands equal bounds.
-    pub(crate) fn reuse_range(&mut self, range: Range<usize>, contains_focus: bool) {
-        let Some(entries) = self.rendered.log.get(range) else {
-            return;
-        };
-        let in_range: FxHashSet<NodeId> = entries.iter().map(|(_, id, _)| *id).collect();
-        let mut pushed = FxHashSet::default();
-        // Decided parents first (reverse), appended in pop order (children
-        // first) so the next frame's range reads the same way.
-        let mut kept = Vec::with_capacity(entries.len());
-        for (parent, id, node) in entries.iter().rev() {
-            let parent_in_range = in_range.contains(parent);
-            if parent_in_range && !pushed.contains(parent) {
-                continue;
-            }
-            if !self.nodes.seen_ids.insert(*id) {
-                if let Some(element) = self.rendered.element_ids.get(id) {
-                    self.refused.push((*id, element.clone()));
-                }
-                continue;
-            }
-            let parent = match (parent_in_range, self.nodes.ids_stack.last()) {
-                (true, _) => *parent,
-                (false, Some(head)) => *head,
-                (false, None) => continue,
-            };
-            pushed.insert(*id);
-            kept.push((parent, *id, node.clone(), !parent_in_range));
-            if let Some(focus_id) = self.rendered.focus_ids.get(id) {
-                self.focus_ids.insert(*id, *focus_id);
-            }
-            if let Some(bounds) = self.rendered.node_bounds.get(id) {
-                self.node_bounds.insert(*id, *bounds);
-            }
-            if let Some(element) = self.rendered.element_ids.get(id) {
-                self.element_ids.insert(*id, element.clone());
-            }
-            if let Some(listeners) = self.rendered.action_listeners.remove(id) {
-                self.action_listeners
-                    .entry(*id)
-                    .or_default()
-                    .extend(listeners);
-            }
-        }
-        for (parent, id, mut node, top) in kept.into_iter().rev() {
-            // Pop order, so top-level siblings join the head as they were.
-            if top && let Some(head) = self.nodes.nodes_stack.last_mut() {
-                head.push_child(id);
-            }
-            // A child left out above must not stay listed under its parent.
-            if node.children().iter().any(|c| !pushed.contains(c)) {
-                let children: Vec<NodeId> = node
-                    .children()
-                    .iter()
-                    .copied()
-                    .filter(|c| pushed.contains(c))
-                    .collect();
-                node.set_children(children);
-            }
-            self.nodes.all_nodes.push((id, node.clone()));
-            self.nodes.log.push((parent, id, node));
-        }
-        if contains_focus && let Some(focus) = self.rendered.focus.filter(|f| pushed.contains(f)) {
-            self.nodes.focus = Some(focus);
-        }
-        // A replayed claim is judged as a live build would judge it, by this
-        // frame's focus: it counts when its gate is the focused node (set in
-        // the range above, or by an ancestor already pushed live). The gate
-        // can have gained or lost the focus since the range was built.
-        for (claim, gate) in &self.rendered.claims {
-            if pushed.contains(claim) {
-                self.claims.push((*claim, *gate));
-                if gate.is_some() && *gate == self.nodes.focus {
-                    self.nodes.set_active_descendant(*claim);
-                }
-            }
-        }
     }
 
     /// Finalize the tree and produce a [`TreeUpdate`] for the platform adapter.
@@ -467,10 +292,6 @@ impl A11y {
         #[cfg(debug_assertions)]
         self.debug.capture_node_info(&self.nodes.node_info);
         update
-    }
-
-    pub(crate) fn last_tree_update(&self) -> Option<&TreeUpdate> {
-        self.debug.last_tree_update()
     }
 
     pub(crate) fn debug_tree_json(&self) -> Option<String> {
@@ -553,23 +374,14 @@ pub(crate) struct A11yNodeBuilder {
     /// This is the exact type required by accesskit, so we can't just make it a
     /// `HashMap<NodeId, Node>` to remove the need for `seen_ids`
     all_nodes: Vec<(NodeId, accesskit::Node)>,
-    /// `(parent, id, node)` for every `all_nodes` push this frame, in the
-    /// same order, so a reused prepaint range can replay its nodes (see
-    /// [`A11y::reuse_range`]); [`crate::Window::prepaint_index`] records its
-    /// length. `finalize` leaves it alone.
-    log: Vec<(NodeId, NodeId, accesskit::Node)>,
-    /// `(parent, children)` for every node a deferred draw built under a
-    /// parent finished earlier this frame (see [`Self::reopen`]); `finalize`
-    /// lists the children under their parent.
-    adopted: Vec<(NodeId, Vec<NodeId>)>,
     seen_ids: FxHashSet<NodeId>,
     /// The node that GPUI considers focused. Note that this may be different to
     /// what is reported to accesskit - see [`Self::active_descendant`]
     focus: Option<NodeId>,
-    /// If a node calls `.aria_active_descendant()`, AND its nearest focusable
-    /// ancestor is focused, override it as the focused node. This supports the
-    /// "active descendant" pattern, which allows a focused container to act as
-    /// if a descendant is focused.
+    /// If a node calls `.aria_active_descendant()`, AND an ancestor is focused,
+    /// override it as the focused node. This supports the "active descendant"
+    /// pattern, which allows a focused container to act as if a descendant is
+    /// focused.
     active_descendant: Option<NodeId>,
     #[cfg(debug_assertions)]
     node_info: FxHashMap<NodeId, debug::NodeDebugInfo>,
@@ -581,8 +393,6 @@ impl A11yNodeBuilder {
             ids_stack: SmallVec::new(),
             nodes_stack: SmallVec::new(),
             all_nodes: Vec::new(),
-            log: Vec::new(),
-            adopted: Vec::new(),
             seen_ids: FxHashSet::default(),
             focus: None,
             active_descendant: None,
@@ -642,58 +452,12 @@ impl A11yNodeBuilder {
         if let Some(parent) = self.nodes_stack.last_mut() {
             parent.push_child(id);
         }
-        self.log_node(id, &node);
         self.all_nodes.push((id, node));
         true
     }
 
-    /// Records `node` in [`Self::log`] under the current top-of-stack parent.
-    fn log_node(&mut self, id: NodeId, node: &accesskit::Node) {
-        if let Some(parent) = self.ids_stack.last() {
-            self.log.push((*parent, id, node.clone()));
-        }
-    }
-
-    pub(crate) fn log_len(&self) -> usize {
-        self.log.len()
-    }
-
     pub(crate) fn current_node_mut(&mut self) -> Option<&mut accesskit::Node> {
         self.nodes_stack.last_mut()
-    }
-
-    /// The node on top of the stack: the parent of the next node pushed.
-    pub(crate) fn head(&self) -> Option<NodeId> {
-        self.ids_stack.last().copied()
-    }
-
-    /// Reopens `parent`, a node finished earlier this frame, for the nodes a
-    /// deferred draw registered under it builds now: they are pushed (and
-    /// logged) as its children, and [`Self::close_reopened`] hands them to it.
-    /// The node itself was finished when the elements drawn in place popped
-    /// it, so it stays in `all_nodes` and the stack holds only a collector.
-    ///
-    /// Returns `false`, and opens nothing, for the root (still on the stack)
-    /// and for a node not in this frame's tree; the draw's nodes are then the
-    /// root's children.
-    pub(crate) fn reopen(&mut self, parent: NodeId) -> bool {
-        if parent == ROOT_NODE_ID || !self.seen_ids.contains(&parent) {
-            return false;
-        }
-        self.ids_stack.push(parent);
-        self.nodes_stack
-            .push(accesskit::Node::new(accesskit::Role::GenericContainer));
-        true
-    }
-
-    /// Closes the node [`Self::reopen`] opened, keeping the children pushed
-    /// under it for `finalize`.
-    pub(crate) fn close_reopened(&mut self) {
-        if let (Some(parent), Some(collector)) = (self.ids_stack.pop(), self.nodes_stack.pop())
-            && !collector.children().is_empty()
-        {
-            self.adopted.push((parent, collector.children().to_vec()));
-        }
     }
 
     /// Pop the current node off the stack and finalize it into the all_nodes
@@ -702,7 +466,6 @@ impl A11yNodeBuilder {
         debug_assert!(self.ids_stack.len() > 1, "pop would remove the root node");
 
         if let (Some(id), Some(node)) = (self.ids_stack.pop(), self.nodes_stack.pop()) {
-            self.log_node(id, &node);
             self.all_nodes.push((id, node));
         }
     }
@@ -710,8 +473,6 @@ impl A11yNodeBuilder {
     /// Push the root node to start a new frame.
     fn begin_frame(&mut self, window_title: Option<&SharedString>) {
         self.all_nodes.clear();
-        self.log.clear();
-        self.adopted.clear();
         self.ids_stack.clear();
         self.nodes_stack.clear();
         self.seen_ids.clear();
@@ -738,24 +499,15 @@ impl A11yNodeBuilder {
         self.focus == Some(id)
     }
 
-    /// The current node's nearest focusable ancestor: the first node below it
-    /// on the stack that is in `focus_ids`. It gates the node's
-    /// active-descendant claim, which counts only while it is the focused node.
-    ///
-    /// A focusable element with no role pushes no node, so the walk passes
-    /// over it; it can never be the focused node either.
-    pub(crate) fn nearest_focusable_ancestor(
-        &self,
-        focus_ids: &FxHashMap<NodeId, FocusId>,
-    ) -> Option<NodeId> {
+    pub(crate) fn focus_is_ancestor_of_current(&self) -> bool {
+        let Some(focus) = self.focus else {
+            return false;
+        };
+
         // The current node is on top of the stack; everything below it is an
         // ancestor.
         let ancestor_count = self.ids_stack.len().saturating_sub(1);
-        self.ids_stack[..ancestor_count]
-            .iter()
-            .rev()
-            .find(|id| focus_ids.contains_key(id))
-            .copied()
+        self.ids_stack[..ancestor_count].contains(&focus)
     }
 
     pub(crate) fn set_active_descendant(&mut self, id: NodeId) {
@@ -809,24 +561,6 @@ impl A11yNodeBuilder {
             }
         }
 
-        // A deferred draw's nodes join the node it was drawn in.
-        if !self.adopted.is_empty() {
-            let index: FxHashMap<NodeId, usize> = self
-                .all_nodes
-                .iter()
-                .enumerate()
-                .map(|(ix, (id, _))| (*id, ix))
-                .collect();
-            for (parent, children) in self.adopted.drain(..) {
-                let ix = index.get(&parent).or_else(|| index.get(&ROOT_NODE_ID));
-                if let Some(&ix) = ix {
-                    for child in children {
-                        self.all_nodes[ix].1.push_child(child);
-                    }
-                }
-            }
-        }
-
         let focus = match self.active_descendant {
             Some(id) if self.has_node(id) => id,
             Some(id) => {
@@ -844,7 +578,7 @@ impl A11yNodeBuilder {
         let nodes = std::mem::take(&mut self.all_nodes);
         let update = TreeUpdate {
             nodes,
-            tree: Some(accesskit::TreeInfo::new(ROOT_NODE_ID)),
+            tree: Some(accesskit::Tree::new(ROOT_NODE_ID)),
             tree_id: accesskit::TreeId::ROOT,
             focus,
         };
@@ -904,7 +638,7 @@ mod tests {
     // Import specific items rather than glob-importing `super`, which would pull
     // in gpui's own `test` attribute macro and shadow the standard one.
     use super::{A11y, A11yNodeBuilder, ROOT_NODE_ID};
-    use crate::{Bounds, ElementId, FocusId, GlobalElementId, point, px, size};
+    use crate::FocusId;
     use accesskit::{NodeId, Role};
     use std::sync::{Arc, atomic::AtomicBool};
 
@@ -924,176 +658,6 @@ mod tests {
         a11y
     }
 
-    fn element(name: &'static str) -> GlobalElementId {
-        GlobalElementId(Arc::from([ElementId::Name(name.into())]))
-    }
-
-    // A second element with an id already used this frame: panic in debug; in
-    // release its node is left out and the element is recorded as refused.
-    #[test]
-    #[cfg_attr(debug_assertions, should_panic(expected = "Duplicate a11y node id"))]
-    fn a_second_element_with_one_id_is_refused() {
-        let mut a11y = new_a11y();
-        let id = NodeId(1);
-        let (first, second) = (element("first"), element("second"));
-
-        assert!(a11y.push_element(id, test_node(), &first));
-        a11y.nodes.pop();
-        assert!(!a11y.push_element(id, test_node(), &second));
-
-        assert_eq!(a11y.refused_elements(), [(id, second)]);
-        assert_eq!(a11y.element_ids.get(&id), Some(&first));
-
-        a11y.begin_frame();
-        assert!(a11y.refused_elements().is_empty());
-    }
-
-    // A frame's tree, then the next frame replaying it whole: the focused
-    // container's active-descendant claim and the item's bounds come back
-    // with the nodes, and the replayed nodes hang under the new root.
-    #[test]
-    fn a_reused_range_carries_the_claim_and_the_bounds() {
-        let mut a11y = new_a11y();
-        let container = NodeId(1);
-        let item = NodeId(2);
-        let bounds = Bounds::new(point(px(1.), px(2.)), size(px(3.), px(4.)));
-
-        push_focusable(&mut a11y, container);
-        a11y.set_focus(container);
-        assert!(a11y.nodes.push(item, test_node()));
-        a11y.node_bounds.insert(item, bounds);
-        a11y.set_active_descendant(item);
-        a11y.nodes.pop(); // item
-        a11y.nodes.pop(); // container
-        assert_eq!(a11y.end_frame(Default::default()).focus, item);
-
-        a11y.begin_frame();
-        assert_eq!(a11y.rendered.log.len(), 2);
-        a11y.reuse_range(0..2, true);
-
-        assert_eq!(a11y.nodes.focus, Some(container));
-        assert_eq!(a11y.nodes.active_descendant, Some(item));
-        assert_eq!(a11y.node_bounds.get(&item), Some(&bounds));
-        let update = a11y.end_frame(Default::default());
-        assert_eq!(update.focus, item);
-        let root = update.nodes.iter().find(|(id, _)| *id == ROOT_NODE_ID);
-        assert_eq!(root.map(|(_, n)| n.children()), Some(&[container][..]));
-    }
-
-    // A claim refused last frame (its container unfocused) counts when the
-    // range replays under the container focused this frame; a claim honored
-    // last frame is dropped when the focus has left the container.
-    #[test]
-    fn a_replayed_claim_is_judged_by_this_frames_focus() {
-        let mut a11y = new_a11y();
-        let container = NodeId(1);
-        let item = NodeId(2);
-
-        push_focusable(&mut a11y, container);
-        assert!(a11y.nodes.push(item, test_node()));
-        a11y.set_active_descendant(item);
-        a11y.nodes.pop(); // item
-        a11y.nodes.pop(); // container
-        assert_eq!(a11y.end_frame(Default::default()).focus, ROOT_NODE_ID);
-
-        a11y.begin_frame();
-        a11y.reuse_range(0..2, false);
-        // The container replayed, focus arrives on it live this frame.
-        a11y.set_focusable(container, FocusId::default());
-        a11y.set_focus(container);
-        assert_eq!(a11y.nodes.active_descendant, None, "judged at the replay");
-
-        a11y.begin_frame();
-        a11y.reuse_range(0..2, true);
-        assert_eq!(a11y.nodes.focus, Some(container));
-        assert_eq!(a11y.nodes.active_descendant, Some(item));
-        assert_eq!(a11y.end_frame(Default::default()).focus, item);
-
-        a11y.begin_frame();
-        a11y.reuse_range(0..2, false);
-        assert_eq!(a11y.nodes.focus, None);
-        assert_eq!(a11y.nodes.active_descendant, None);
-    }
-
-    // A replayed node whose id this frame already pushed is left out, and so
-    // is its subtree: no node is grafted under a parent that is not there.
-    #[test]
-    fn a_reused_duplicate_is_left_out_with_its_subtree() {
-        let mut a11y = new_a11y();
-        let container = NodeId(1);
-        let item = NodeId(2);
-        let element = element("container");
-
-        assert!(a11y.push_element(container, test_node(), &element));
-        assert!(a11y.nodes.push(item, test_node()));
-        a11y.nodes.pop(); // item
-        a11y.nodes.pop(); // container
-        a11y.end_frame(Default::default());
-
-        a11y.begin_frame();
-        assert!(a11y.nodes.seen_ids.insert(container));
-        a11y.reuse_range(0..2, false);
-        assert_eq!(a11y.refused_elements(), [(container, element)]);
-
-        let update = a11y.end_frame(Default::default());
-        let ids: Vec<NodeId> = update.nodes.iter().map(|(id, _)| *id).collect();
-        assert_eq!(ids, [ROOT_NODE_ID]);
-    }
-
-    // Top-level siblings of a replayed range keep their order under the head.
-    #[test]
-    fn a_reused_range_keeps_sibling_order() {
-        let mut a11y = new_a11y();
-        assert!(a11y.nodes.push_leaf(NodeId(1), test_node()));
-        assert!(a11y.nodes.push_leaf(NodeId(2), test_node()));
-        a11y.end_frame(Default::default());
-
-        a11y.begin_frame();
-        a11y.reuse_range(0..2, false);
-        let update = a11y.end_frame(Default::default());
-        let root = update.nodes.iter().find(|(id, _)| *id == ROOT_NODE_ID);
-        assert_eq!(
-            root.map(|(_, n)| n.children()),
-            Some(&[NodeId(1), NodeId(2)][..])
-        );
-    }
-
-    // A replayed child whose id this frame already pushed elsewhere is not
-    // left listed under its replayed parent (accesskit panics on a child
-    // listed twice).
-    #[test]
-    fn a_reused_child_taken_live_is_listed_once() {
-        let mut a11y = new_a11y();
-        let (container, item) = (NodeId(1), NodeId(2));
-        assert!(a11y.nodes.push(container, test_node()));
-        assert!(a11y.nodes.push_leaf(item, test_node()));
-        a11y.nodes.pop(); // container
-        a11y.end_frame(Default::default());
-
-        a11y.begin_frame();
-        assert!(a11y.nodes.push_leaf(item, test_node()));
-        a11y.reuse_range(0..2, false);
-        let update = a11y.end_frame(Default::default());
-        let parents = update
-            .nodes
-            .iter()
-            .filter(|(_, n)| n.children().contains(&item))
-            .count();
-        assert_eq!(parents, 1);
-    }
-
-    #[test]
-    fn distinct_ids_refuse_nothing() {
-        let mut a11y = new_a11y();
-
-        assert!(a11y.push_element(NodeId(1), test_node(), &element("first")));
-        a11y.nodes.pop();
-        assert!(a11y.push_element(NodeId(2), test_node(), &element("second")));
-        a11y.nodes.pop();
-
-        assert!(a11y.refused_elements().is_empty());
-    }
-
     #[test]
     fn accessibility_enabled_is_independent_of_activation() {
         for force_disabled in [false, true] {
@@ -1107,176 +671,94 @@ mod tests {
         }
     }
 
-    // Registers `id` as focusable this frame, as a div with a focus handle does
-    // in its prepaint before its children.
-    fn push_focusable(a11y: &mut A11y, id: NodeId) {
-        assert!(a11y.nodes.push(id, test_node()));
-        a11y.set_focusable(id, FocusId::default());
-    }
-
     #[test]
     fn active_descendant_honored_when_container_focused() {
-        let mut a11y = new_a11y();
+        let mut builder = new_builder();
         let container = NodeId(1);
         let item = NodeId(2);
 
-        push_focusable(&mut a11y, container);
-        a11y.set_focus(container);
-        assert!(a11y.nodes.push(item, test_node()));
+        assert!(builder.push(container, test_node()));
+        builder.set_focus(container);
+        assert!(builder.push(item, test_node()));
 
-        // The item's nearest focusable ancestor is the focused container, so
-        // the claim is honored.
-        a11y.set_active_descendant(item);
+        // The item is on top of the stack; the focused container is its
+        // ancestor, so the claim is honored.
+        assert!(builder.focus_is_ancestor_of_current());
+        builder.set_active_descendant(item);
 
-        a11y.nodes.pop(); // item
-        a11y.nodes.pop(); // container
-        let update = a11y.end_frame(Default::default());
+        builder.pop(); // item
+        builder.pop(); // container
+        let update = builder.finalize();
         assert_eq!(update.focus, item);
     }
 
     #[test]
     fn active_descendant_honored_for_deep_descendant() {
-        let mut a11y = new_a11y();
+        let mut builder = new_builder();
         let container = NodeId(1);
         let group = NodeId(2);
         let item = NodeId(3);
 
-        push_focusable(&mut a11y, container);
-        a11y.set_focus(container);
-        assert!(a11y.nodes.push(group, test_node()));
-        assert!(a11y.nodes.push(item, test_node()));
+        assert!(builder.push(container, test_node()));
+        builder.set_focus(container);
+        assert!(builder.push(group, test_node()));
+        assert!(builder.push(item, test_node()));
 
         // The item is a grandchild of the focused container; depth doesn't
-        // matter while no focusable node sits in between.
-        a11y.set_active_descendant(item);
+        // matter, the focused ancestor is still on the stack.
+        assert!(builder.focus_is_ancestor_of_current());
+        builder.set_active_descendant(item);
 
-        a11y.nodes.pop(); // item
-        a11y.nodes.pop(); // group
-        a11y.nodes.pop(); // container
-        let update = a11y.end_frame(Default::default());
+        builder.pop(); // item
+        builder.pop(); // group
+        builder.pop(); // container
+        let update = builder.finalize();
         assert_eq!(update.focus, item);
-    }
-
-    // A focused outer node holds a focusable inner node that is not focused;
-    // the inner node's item claims. The inner node is the item's nearest
-    // focusable ancestor and does not have the keys, so the claim is ignored
-    // and the outer node stays focused.
-    #[test]
-    fn active_descendant_ignored_under_unfocused_focusable_ancestor() {
-        let mut a11y = new_a11y();
-        let outer = NodeId(1);
-        let inner = NodeId(2);
-        let item = NodeId(3);
-
-        push_focusable(&mut a11y, outer);
-        a11y.set_focus(outer);
-        push_focusable(&mut a11y, inner);
-        assert!(a11y.nodes.push(item, test_node()));
-        a11y.set_active_descendant(item);
-        a11y.nodes.pop(); // item
-        a11y.nodes.pop(); // inner
-        a11y.nodes.pop(); // outer
-
-        let update = a11y.end_frame(Default::default());
-        assert_eq!(update.focus, outer);
-    }
-
-    // Two composites each claim their active item: the focused one's item and,
-    // inside it, an unfocused focusable one's. Only the focused composite's
-    // claim counts, so there is one claim and no double-claim panic.
-    #[test]
-    fn focused_composite_claim_wins_over_unfocused_one() {
-        let mut a11y = new_a11y();
-        let focused = NodeId(1);
-        let focused_item = NodeId(2);
-        let unfocused = NodeId(3);
-        let unfocused_item = NodeId(4);
-
-        push_focusable(&mut a11y, focused);
-        a11y.set_focus(focused);
-
-        assert!(a11y.nodes.push(focused_item, test_node()));
-        a11y.set_active_descendant(focused_item);
-        a11y.nodes.pop(); // focused_item
-
-        push_focusable(&mut a11y, unfocused);
-        assert!(a11y.nodes.push(unfocused_item, test_node()));
-        a11y.set_active_descendant(unfocused_item);
-        a11y.nodes.pop(); // unfocused_item
-        a11y.nodes.pop(); // unfocused
-
-        a11y.nodes.pop(); // focused
-        let update = a11y.end_frame(Default::default());
-        assert_eq!(update.focus, focused_item);
-    }
-
-    // A focused box (a held pane) holds two unfocused composites that each
-    // claim their active item. Neither claim counts: the box is reported
-    // focused, with no double-claim panic.
-    #[test]
-    fn focused_box_over_two_unfocused_composites_stays_focused() {
-        let mut a11y = new_a11y();
-        let pane = NodeId(1);
-        let composites = [(NodeId(2), NodeId(3)), (NodeId(4), NodeId(5))];
-
-        push_focusable(&mut a11y, pane);
-        a11y.set_focus(pane);
-        for (composite, item) in composites {
-            push_focusable(&mut a11y, composite);
-            assert!(a11y.nodes.push(item, test_node()));
-            a11y.set_active_descendant(item);
-            a11y.nodes.pop(); // item
-            a11y.nodes.pop(); // composite
-        }
-        a11y.nodes.pop(); // pane
-
-        let update = a11y.end_frame(Default::default());
-        assert_eq!(update.focus, pane);
     }
 
     #[test]
     fn active_descendant_ignored_when_focus_in_other_subtree() {
-        let mut a11y = new_a11y();
+        let mut builder = new_builder();
         let focused_container = NodeId(1);
         let focused_leaf = NodeId(2);
         let other_container = NodeId(3);
         let other_item = NodeId(4);
 
         // First subtree holds real focus.
-        assert!(a11y.nodes.push(focused_container, test_node()));
-        push_focusable(&mut a11y, focused_leaf);
-        a11y.set_focus(focused_leaf);
-        a11y.nodes.pop(); // focused_leaf
-        a11y.nodes.pop(); // focused_container
+        assert!(builder.push(focused_container, test_node()));
+        assert!(builder.push(focused_leaf, test_node()));
+        builder.set_focus(focused_leaf);
+        builder.pop(); // focused_leaf
+        builder.pop(); // focused_container
 
-        // Second subtree: its item claims the active descendant, but the
+        // Second subtree: its item would claim the active descendant, but the
         // focus is not on any of its ancestors, so the gate rejects it.
-        push_focusable(&mut a11y, other_container);
-        assert!(a11y.nodes.push(other_item, test_node()));
-        a11y.set_active_descendant(other_item);
-        a11y.nodes.pop(); // other_item
-        a11y.nodes.pop(); // other_container
+        assert!(builder.push(other_container, test_node()));
+        assert!(builder.push(other_item, test_node()));
+        assert!(!builder.focus_is_ancestor_of_current());
+        builder.pop(); // other_item
+        builder.pop(); // other_container
 
-        let update = a11y.end_frame(Default::default());
+        let update = builder.finalize();
         assert_eq!(update.focus, focused_leaf);
     }
 
     #[test]
     fn active_descendant_ignored_when_nothing_focused() {
-        let mut a11y = new_a11y();
+        let mut builder = new_builder();
         let container = NodeId(1);
         let item = NodeId(2);
 
-        push_focusable(&mut a11y, container);
-        assert!(a11y.nodes.push(item, test_node()));
+        assert!(builder.push(container, test_node()));
+        assert!(builder.push(item, test_node()));
 
         // Nothing is focused (focus defaults to the root window node), so the
         // gate rejects the claim.
-        a11y.set_active_descendant(item);
-        a11y.nodes.pop();
-        a11y.nodes.pop();
+        assert!(!builder.focus_is_ancestor_of_current());
+        builder.pop();
+        builder.pop();
 
-        let update = a11y.end_frame(Default::default());
+        let update = builder.finalize();
         assert_eq!(update.focus, ROOT_NODE_ID);
     }
 
@@ -1294,27 +776,24 @@ mod tests {
     }
 
     #[test]
-    fn nearest_focusable_ancestor_excludes_self() {
-        let mut a11y = new_a11y();
+    fn focus_is_ancestor_excludes_self_and_non_ancestors() {
+        let mut builder = new_builder();
         let container = NodeId(1);
-        let inner = NodeId(2);
+        let item = NodeId(2);
 
-        push_focusable(&mut a11y, container);
+        assert!(builder.push(container, test_node()));
+        builder.set_focus(container);
 
-        // With the container itself on top, it is not its own (strict)
-        // ancestor, so it has no gate.
-        assert_eq!(a11y.nodes.nearest_focusable_ancestor(&a11y.focus_ids), None);
+        // With the focused container itself on top, it is not its own (strict)
+        // ancestor, so the gate is false.
+        assert!(!builder.focus_is_ancestor_of_current());
 
-        // A focusable inner node on top: its own registration does not count,
-        // the container is its nearest focusable ancestor.
-        push_focusable(&mut a11y, inner);
-        assert_eq!(
-            a11y.nodes.nearest_focusable_ancestor(&a11y.focus_ids),
-            Some(container)
-        );
+        assert!(builder.push(item, test_node()));
+        // Now the focused container is a strict ancestor of the item on top.
+        assert!(builder.focus_is_ancestor_of_current());
 
-        a11y.nodes.pop();
-        a11y.nodes.pop();
+        builder.pop();
+        builder.pop();
     }
 
     // The double-claim guard panics only in debug builds; in release it falls

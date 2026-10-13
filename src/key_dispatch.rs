@@ -86,9 +86,6 @@ pub(crate) struct DispatchNode {
     pub modifiers_changed_listeners: Vec<ModifiersChangedListener>,
     pub context: Option<KeyContext>,
     pub focus_id: Option<FocusId>,
-    /// The element styles itself by `in_focus`: a focus move onto or off an
-    /// ancestor focusable changes it, so the view that rendered it redraws.
-    in_focus_reader: bool,
     view_id: Option<EntityId>,
     parent: Option<DispatchNodeId>,
 }
@@ -226,10 +223,6 @@ impl DispatchTree {
         self.focusable_node_ids.insert(focus_id, node_id);
     }
 
-    pub fn set_in_focus_reader(&mut self) {
-        self.active_node().in_focus_reader = true;
-    }
-
     pub fn set_view_id(&mut self, view_id: EntityId) {
         if self.view_stack.last().copied() != Some(view_id) {
             let node_id = *self.node_stack.last().unwrap();
@@ -263,7 +256,6 @@ impl DispatchTree {
         }
 
         let target = self.active_node();
-        target.in_focus_reader = source.in_focus_reader;
         target.key_listeners = mem::take(&mut source.key_listeners);
         target.action_listeners = mem::take(&mut source.action_listeners);
         target.modifiers_changed_listeners = mem::take(&mut source.modifiers_changed_listeners);
@@ -614,41 +606,6 @@ impl DispatchTree {
 
     pub fn focusable_node_id(&self, target: FocusId) -> Option<DispatchNodeId> {
         self.focusable_node_ids.get(&target).copied()
-    }
-
-    /// The nearest view that rendered the given focusable: the owner of the
-    /// focus-visible styling and key context a focus move redraws.
-    pub fn view_of_focusable(&self, target: FocusId) -> Option<EntityId> {
-        self.view_of_node(self.focusable_node_id(target)?)
-    }
-
-    /// The views that rendered an `in_focus` reader under the given focusable
-    /// (itself included): their focus-within styling changes when it gains or
-    /// loses the focus. Readers are found by their own focusable, so one in a
-    /// deferred draw anchored under the target counts too.
-    pub fn views_reading_focus_within(&self, target: FocusId) -> Vec<EntityId> {
-        self.nodes
-            .iter()
-            .enumerate()
-            .filter(|(_, node)| {
-                node.in_focus_reader
-                    && node
-                        .focus_id
-                        .is_some_and(|reader| self.focus_contains(target, reader))
-            })
-            .filter_map(|(node_id, _)| self.view_of_node(DispatchNodeId(node_id)))
-            .collect()
-    }
-
-    fn view_of_node(&self, node_id: DispatchNodeId) -> Option<EntityId> {
-        let mut node_id = Some(node_id);
-        while let Some(node) = node_id.map(|id| self.node(id)) {
-            if node.view_id.is_some() {
-                return node.view_id;
-            }
-            node_id = node.parent;
-        }
-        None
     }
 
     pub fn root_node_id(&self) -> DispatchNodeId {
