@@ -1,8 +1,8 @@
 use crate::{
     BoolExt, MacDisplay, NSRange, NSStringExt, TISCopyCurrentKeyboardInputSource,
     TISGetInputSourceProperty, WindowFrameSource, events::platform_input_from_native,
-    kTISPropertyInputSourceIsASCIICapable, kTISPropertyInputSourceType, kTISTypeKeyboardInputMode,
-    ns_string, renderer,
+    kTISPropertyInputSourceID, kTISPropertyInputSourceIsASCIICapable, kTISPropertyInputSourceType,
+    kTISTypeKeyboardInputMode, ns_string, renderer,
 };
 #[cfg(any(test, feature = "test-support"))]
 use anyhow::Result;
@@ -691,6 +691,7 @@ struct MacWindowState {
     previous_modifiers_changed_event: Option<PlatformInput>,
     keystroke_for_do_command: Option<Keystroke>,
     do_command_handled: Option<bool>,
+    korean_key: Option<KoreanKey>,
     external_files_dragged: bool,
     // Whether the next left-mouse click is also the focusing click.
     first_mouse: bool,
@@ -1133,6 +1134,7 @@ impl MacWindow {
                 previous_modifiers_changed_event: None,
                 keystroke_for_do_command: None,
                 do_command_handled: None,
+                korean_key: None,
                 external_files_dragged: false,
                 first_mouse: false,
                 app_owns_titlebar_drag,
@@ -2677,6 +2679,112 @@ unsafe fn is_ime_input_source_active() -> bool {
     }
 }
 
+/// A key down that Apple's Korean input method reads with nothing composed,
+/// in a field that reports no selection. On the first key after the input
+/// source changes, that input method commits the key's bare jamo
+/// (`insertText:`) and composes the next keys into it by reading it back
+/// (`attributedSubstringForProposedRange:`, then a replacement range). A
+/// field with no selection cannot give it back (the web view's page: the
+/// text is the browser's), so the next keys compose without it: 한 types as
+/// ㅎㅏㄴ. Read the same event again, it starts the syllable as marked text.
+/// So the bare jamo is held back while the event is read, and the event is
+/// read once more (`interpret_key`); the second reading is not watched.
+/// winit#4744 reads the key again too (Apple FB17460926).
+enum KoreanKey {
+    /// the first reading; `held`: it gave the bare jamo, held back
+    Reading { jamo: char, held: bool },
+    /// the second: the held jamo stands only if this one gives nothing
+    Rereading { jamo: char },
+}
+
+/// The bare jamo of a key Apple's Korean input method reads with nothing
+/// composed, no command modifier and no selection, as `KoreanKey` watches.
+fn korean_jamo(this: &Object, event: &KeyDownEvent) -> Option<char> {
+    let modifiers = event.keystroke.modifiers;
+    if event.is_held
+        || modifiers.control
+        || modifiers.alt
+        || modifiers.platform
+        || modifiers.function
+    {
+        return None;
+    }
+    let mut chars = event.keystroke.key_char.as_deref()?.chars();
+    let jamo = chars
+        .next()
+        .filter(|c| ('\u{3131}'..='\u{318E}').contains(c))?;
+    // a field that reports a selection gives the jamo back itself
+    let blind = with_input_handler(this, |input_handler| {
+        input_handler.marked_text_range().is_none()
+            && input_handler.selected_text_range(false).is_none()
+    })
+    .unwrap_or(false);
+    (chars.next().is_none() && blind && unsafe { is_apple_korean_input_source() }).then_some(jamo)
+}
+
+unsafe fn is_apple_korean_input_source() -> bool {
+    unsafe {
+        let source = TISCopyCurrentKeyboardInputSource();
+        if source.is_null() {
+            return false;
+        }
+        let id: id = TISGetInputSourceProperty(source, kTISPropertyInputSourceID as *const c_void);
+        let korean = !id.is_null() && id.to_str().starts_with("com.apple.inputmethod.Korean.");
+        CFRelease(source as CFTypeRef);
+        korean
+    }
+}
+
+/// The input context reads a key down (`handleEvent:`): twice when Apple's
+/// Korean input method gave only the key's bare jamo (`KoreanKey`).
+fn interpret_key(this: &Object, native_event: id, event: &KeyDownEvent) -> BOOL {
+    let window_state = unsafe { get_window_state(this) };
+    let reading = korean_jamo(this, event).map(|jamo| KoreanKey::Reading { jamo, held: false });
+    window_state.lock().korean_key = reading;
+    let input_context: id = unsafe { msg_send![this, inputContext] };
+    let handled: BOOL = unsafe { msg_send![input_context, handleEvent: native_event] };
+    let read = window_state.lock().korean_key.take();
+    let Some(KoreanKey::Reading { jamo, held: true }) = read else {
+        return handled;
+    };
+    window_state.lock().korean_key = Some(KoreanKey::Rereading { jamo });
+    let handled: BOOL = unsafe { msg_send![input_context, handleEvent: native_event] };
+    let reread = window_state.lock().korean_key.take();
+    if let Some(KoreanKey::Rereading { jamo }) = reread {
+        put_down_jamo(this, jamo);
+        return YES;
+    }
+    handled
+}
+
+/// Called before each answer the input method gives a key (`insertText:`
+/// with its text and range, else `None`): `true` holds back the bare jamo
+/// of a first reading (`KoreanKey`). Any other answer to that reading first
+/// puts a held jamo down; any answer to the second leaves it out.
+fn korean_key_answer(this: &Object, insert: Option<(&str, &Option<Range<usize>>)>) -> bool {
+    let window_state = unsafe { get_window_state(this) };
+    let key = window_state.lock().korean_key.take();
+    match key {
+        Some(KoreanKey::Reading { jamo, held: false })
+            if insert.is_some_and(|(text, range)| range.is_none() && text.chars().eq([jamo])) =>
+        {
+            window_state.lock().korean_key = Some(KoreanKey::Reading { jamo, held: true });
+            true
+        }
+        Some(KoreanKey::Reading { jamo, held: true }) => {
+            put_down_jamo(this, jamo);
+            false
+        }
+        _ => false,
+    }
+}
+
+fn put_down_jamo(this: &Object, jamo: char) {
+    with_input_handler(this, |input_handler| {
+        input_handler.replace_text_in_range(None, jamo.encode_utf8(&mut [0; 4]))
+    });
+}
+
 extern "C" fn handle_key_event(this: &Object, native_event: id, key_equivalent: bool) -> BOOL {
     let window_state = unsafe { get_window_state(this) };
     let mut lock = window_state.as_ref().lock();
@@ -2762,10 +2870,7 @@ extern "C" fn handle_key_event(this: &Object, native_event: id, key_equivalent: 
                     drop(lock);
                 }
 
-                let handled: BOOL = unsafe {
-                    let input_context: id = msg_send![this, inputContext];
-                    msg_send![input_context, handleEvent: native_event]
-                };
+                let handled = interpret_key(this, native_event, &key_down_event);
                 window_state.as_ref().lock().keystroke_for_do_command.take();
                 if let Some(handled) = window_state.as_ref().lock().do_command_handled.take() {
                     return handled as BOOL;
@@ -2803,10 +2908,7 @@ extern "C" fn handle_key_event(this: &Object, native_event: id, key_equivalent: 
                 return NO;
             }
 
-            unsafe {
-                let input_context: id = msg_send![this, inputContext];
-                msg_send![input_context, handleEvent: native_event]
-            }
+            interpret_key(this, native_event, &key_down_event)
         }
 
         PlatformInput::KeyUp(_) => {
@@ -3486,6 +3588,9 @@ extern "C" fn insert_text(this: &Object, _: Sel, text: id, replacement_range: NS
 
         let text = text.to_str();
         let replacement_range = replacement_range.to_range();
+        if korean_key_answer(this, Some((text, &replacement_range))) {
+            return;
+        }
         with_input_handler(this, |input_handler| {
             input_handler.replace_text_in_range(replacement_range, text)
         });
@@ -3499,6 +3604,7 @@ extern "C" fn set_marked_text(
     selected_range: NSRange,
     replacement_range: NSRange,
 ) {
+    korean_key_answer(this, None);
     unsafe {
         let is_attributed_string: BOOL =
             msg_send![text, isKindOfClass: [class!(NSAttributedString)]];
@@ -3516,6 +3622,7 @@ extern "C" fn set_marked_text(
     }
 }
 extern "C" fn unmark_text(this: &Object, _: Sel) {
+    korean_key_answer(this, None);
     with_input_handler(this, |input_handler| input_handler.unmark_text());
 }
 
@@ -3551,6 +3658,7 @@ extern "C" fn attributed_substring_for_proposed_range(
 // We ignore which selector it asks us to do because the user may have
 // bound the shortcut to something else.
 extern "C" fn do_command_by_selector(this: &Object, _: Sel, _: Sel) {
+    korean_key_answer(this, None);
     let state = unsafe { get_window_state(this) };
     let mut lock = state.as_ref().lock();
     let keystroke = lock.keystroke_for_do_command.take();
