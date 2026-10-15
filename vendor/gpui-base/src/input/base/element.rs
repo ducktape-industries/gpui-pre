@@ -3030,6 +3030,17 @@ impl<M: InputModeKind> Element for TextElement<M> {
             ElementInputHandler::new(bounds, self.state.clone()),
             cx,
         );
+        // App-driven edits and selection moves reach the platform's text
+        // services here, once per frame; the window ignores the call for an
+        // unfocused field, the backend for edits the keyboard made itself.
+        let (content_changed, selection_changed) =
+            self.state.update(cx, |state, _| state.platform_sync());
+        if content_changed {
+            window.notify_text_input_changed(&focus_handle);
+        }
+        if selection_changed {
+            window.notify_text_selection_changed(&focus_handle);
+        }
 
         // Paint multi line text
         let line_height = window.line_height();

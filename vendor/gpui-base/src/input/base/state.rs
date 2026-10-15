@@ -8,7 +8,8 @@ use gpui::{
     EventEmitter, FocusHandle, Focusable, InteractiveElement as _, IntoElement, KeyBinding,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement as _, Pixels, Point,
     Render, ScrollHandle, ScrollWheelEvent, SharedString, Styled as _, Subscription,
-    UTF16Selection, WeakFocusHandle, Window, actions, div, point, prelude::FluentBuilder as _, px,
+    TextInputConfiguration, UTF16Selection, WeakFocusHandle, Window, actions, div, point,
+    prelude::FluentBuilder as _, px,
 };
 use ropey::{Rope, RopeSlice};
 use serde::Deserialize;
@@ -472,6 +473,14 @@ pub struct InputBaseState<M: InputModeKind> {
     pub(super) masked: bool,
     pub(super) clean_on_escape: bool,
     pub(super) submit_on_enter: bool,
+    /// What the platform's text services are told about this field (software
+    /// keyboard kind, autocorrect, the Return key's action).
+    pub(super) text_input: TextInputConfiguration,
+    /// Bumped on every edit of `text`, so the element can tell the platform
+    /// about app-driven edits once per frame (`platform_sync`).
+    pub(super) text_generation: u64,
+    /// The (text generation, selection) the platform was last told about.
+    pub(super) platform_synced: Option<(u64, Range<usize>)>,
     pub(super) show_whitespaces: bool,
     /// This flag tells the renderer to prefer the end of the current visual line.
     pub(crate) cursor_line_end_affinity: bool,
@@ -838,6 +847,9 @@ impl<M: InputModeKind> InputBaseState<M> {
             masked: false,
             clean_on_escape: false,
             submit_on_enter: false,
+            text_input: TextInputConfiguration::default(),
+            text_generation: 0,
+            platform_synced: None,
             show_whitespaces: false,
             loading: false,
             pattern: None,
@@ -1257,6 +1269,53 @@ impl<M: InputModeKind> InputBaseState<M> {
         cx.notify();
     }
 
+    /// What the platform's text services are told about this field: the
+    /// software keyboard's kind, autocorrect, autocapitalize, suggestions and
+    /// the Return key's action ([`TextInputConfiguration`]). The default asks
+    /// for nothing in particular.
+    pub fn text_input(mut self, configuration: TextInputConfiguration) -> Self {
+        self.text_input = configuration;
+        self
+    }
+
+    pub fn set_text_input(
+        &mut self,
+        configuration: TextInputConfiguration,
+        cx: &mut Context<Self>,
+    ) {
+        self.text_input = configuration;
+        cx.notify();
+    }
+
+    /// Which of the text and the selection changed since the platform was last
+    /// told, and record the current state as told. The element calls this once
+    /// per frame after `Window::handle_input` and forwards the answer through
+    /// `Window::notify_text_input_changed` / `notify_text_selection_changed`;
+    /// the backend ignores the notice for edits the keyboard made itself.
+    pub(crate) fn platform_sync(&mut self) -> (bool, bool) {
+        let now = (self.text_generation, self.selected_range());
+        let (content, selection) = match &self.platform_synced {
+            Some((generation, range)) => (*generation != now.0, *range != now.1),
+            None => (false, false),
+        };
+        self.platform_synced = Some(now);
+        (content, selection)
+    }
+
+    /// Tell the platform's text services now what changed, from inside a
+    /// platform-entry handler. An edit the keyboard itself made is filtered by
+    /// the backend there (gpui_ios's `native_edit`); an app-driven call to the
+    /// same method reaches them, as the core doc asks.
+    fn tell_platform(&mut self, window: &Window) {
+        let (content, selection) = self.platform_sync();
+        if content {
+            window.notify_text_input_changed(&self.focus_handle);
+        }
+        if selection {
+            window.notify_text_selection_changed(&self.focus_handle);
+        }
+    }
+
     /// Set whether to show whitespace characters.
     #[doc(hidden)]
     pub fn show_whitespaces(mut self, show: bool) -> Self {
@@ -1331,6 +1390,7 @@ impl<M: InputModeKind> InputBaseState<M> {
     pub fn default_value(mut self, value: impl Into<SharedString>) -> Self {
         let text: SharedString = value.into();
         self.text = Rope::from(self.normalize_input(&text).as_ref());
+        self.text_generation = self.text_generation.wrapping_add(1);
         if let Some(diagnostics) = self.mode.diagnostics_mut() {
             diagnostics.reset(&self.text)
         }
@@ -3917,6 +3977,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             let old_text = self.text.clone();
             self.mode.adjust_auto_closed_pair(range, new_text.len());
             self.text.replace(range.clone(), new_text);
+            self.text_generation = self.text_generation.wrapping_add(1);
 
             M::adjust_annotations(self, range, new_text.len());
             recorded |= self.push_history(
@@ -4125,9 +4186,10 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
             .map(|range| self.range_to_utf16(&range.into()))
     }
 
-    fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
+    fn unmark_text(&mut self, window: &mut Window, _cx: &mut Context<Self>) {
         self.ime_marked_range = None;
         self.undo_manager.commit_transaction();
+        self.tell_platform(window);
     }
 
     /// Replace text in range.
@@ -4143,6 +4205,26 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
     ) {
         let requested_intent = self.undo_manager.take_pending_intent();
         if !self.is_editable() {
+            return;
+        }
+        // A software keyboard's Return key arrives as inserted text, never as an
+        // Enter key event (iOS). On a single-line field that is the Enter action:
+        // nothing is inserted, a composition in flight is over. An app's own
+        // `insert`/`set_value` (silent replaces) keep their old behaviour.
+        if self.is_single_line()
+            && !self.silent_replace_text
+            && !new_text.is_empty()
+            && new_text.chars().all(|c| c == '\n' || c == '\r')
+        {
+            self.ime_marked_range = None;
+            self.undo_manager.break_transaction_coalescing();
+            if self.emit_events {
+                cx.emit(InputEvent::PressEnter {
+                    secondary: false,
+                    shift: false,
+                });
+            }
+            self.tell_platform(window);
             return;
         }
         let selection_before = *self.active_selection();
@@ -4188,6 +4270,7 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
             if let Some(target) = self.skip_over_target(new_text) {
                 self.set_cursor_to(target);
                 self.update_preferred_column();
+                self.tell_platform(window);
                 cx.notify();
                 return;
             }
@@ -4260,6 +4343,7 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
         let old_text = self.text.clone();
         self.mode.adjust_auto_closed_pair(&range, new_text.len());
         self.text.replace(range.clone(), new_text);
+        self.text_generation = self.text_generation.wrapping_add(1);
 
         let mut new_offset = (range.start + new_text.len()).min(self.text.len());
 
@@ -4287,6 +4371,7 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
                 let mask_text = self.mask_pattern.mask(&pending_text);
                 mask_changed = mask_text.as_str() != pending_text;
                 self.text = Rope::from(mask_text.as_str());
+                self.text_generation = self.text_generation.wrapping_add(1);
                 let new_text_len =
                     (new_text.len() + mask_text.len()).saturating_sub(pending_text.len());
                 new_offset = (range.start + new_text_len).min(mask_text.len());
@@ -4369,6 +4454,7 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
         if self.emit_events {
             cx.emit(InputEvent::Change);
         }
+        self.tell_platform(window);
         cx.notify();
     }
 
@@ -4422,6 +4508,7 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
         let old_text = self.text.clone();
         self.mode.adjust_auto_closed_pair(&range, new_text.len());
         self.text.replace(range.clone(), new_text);
+        self.text_generation = self.text_generation.wrapping_add(1);
 
         if self.is_single_line() {
             let pending_text = self.text.to_string();
@@ -4500,6 +4587,7 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
         if new_text.is_empty() {
             self.undo_manager.commit_transaction();
         }
+        self.tell_platform(window);
         cx.notify();
     }
 
@@ -4584,6 +4672,115 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
         }
 
         None
+    }
+
+    // The UIKit text contract: iOS's keyboard reads the document back and writes
+    // the selection on every keystroke (the Korean keyboard composes a syllable
+    // by selecting, deleting and re-inserting it), and takes the keyboard only
+    // when the field reports a length or an editable range.
+
+    /// `None` when disabled or read-only: gpui_ios falls back to the length
+    /// when the editable range is `None`, and a keyboard must not rise for a
+    /// field that types nothing.
+    fn text_length_utf16(
+        &mut self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        self.is_editable()
+            .then(|| self.offset_to_utf16(self.text.len()))
+    }
+
+    /// The whole document while the field is editable; `None` when disabled or
+    /// read-only, so no keyboard rises for it.
+    fn text_input_editable_range(
+        &mut self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Range<usize>> {
+        self.is_editable()
+            .then(|| 0..self.offset_to_utf16(self.text.len()))
+    }
+
+    fn set_selected_text_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let range = self.range_from_utf16(&range_utf16);
+        self.set_selected_range(range, cx);
+        self.tell_platform(window);
+    }
+
+    /// One rectangle per visual row the range crosses, from the last layout;
+    /// the first holds the range's start and the last its end.
+    fn selection_bounds_for_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        bounds: Bounds<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Vec<Bounds<Pixels>> {
+        let Some(last_layout) = self.last_layout.as_ref() else {
+            return Vec::new();
+        };
+        let range = self.range_from_utf16(&range_utf16);
+        let line_height = last_layout.line_height;
+        let origin = bounds.origin + point(last_layout.line_number_width, px(0.));
+        let mut rects = Vec::new();
+        let mut y = last_layout.visible_top;
+        for (vi, line) in last_layout.lines.iter().enumerate() {
+            let line_start = last_layout.visible_line_byte_offsets[vi];
+            let line_end = line_start + line.len();
+            let size = line.size(line_height);
+            if range.start <= line_end && range.end >= line_start {
+                let start = range.start.max(line_start) - line_start;
+                let end = range.end.min(line_end) - line_start;
+                let start_at = line.position_for_index(start, last_layout, false);
+                let end_at = line.position_for_index(end, last_layout, true);
+                if let (Some(start_at), Some(end_at)) = (start_at, end_at) {
+                    // One rectangle per wrapped row between the two positions:
+                    // the first row from the start to its right edge, the rows
+                    // between full width, the last row from the left edge to
+                    // the end; a single row from the start to the end.
+                    let mut row_y = start_at.y;
+                    while row_y <= end_at.y {
+                        let left = if row_y == start_at.y {
+                            start_at.x
+                        } else {
+                            px(0.)
+                        };
+                        let right = if row_y == end_at.y {
+                            end_at.x
+                        } else {
+                            size.width
+                        };
+                        rects.push(Bounds::from_corners(
+                            origin + point(left, y + row_y),
+                            origin + point(right, y + row_y + line_height),
+                        ));
+                        row_y += line_height;
+                    }
+                }
+            }
+            y += size.height;
+            if line_start > range.end {
+                break;
+            }
+        }
+        rects
+    }
+
+    fn text_input_configuration(
+        &mut self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> TextInputConfiguration {
+        let mut configuration = self.text_input.clone();
+        // A masked field holds a secret whatever the host set.
+        configuration.secure |= self.masked;
+        configuration
     }
 }
 
@@ -5665,6 +5862,103 @@ mod tests {
             let line = state.input_bounds;
             assert_eq!(line.center().y, px(30.), "line {line:?}");
         });
+    }
+
+    /// The UIKit text contract: the field reports its length and editable
+    /// range (none when read-only), takes a selection the platform writes, and
+    /// treats a software Return key's inserted newline as the Enter action
+    /// without ever holding a newline.
+    #[gpui::test]
+    fn uikit_text_contract_on_a_single_line_field(cx: &mut TestAppContext) {
+        use gpui::EntityInputHandler as _;
+        use std::{cell::RefCell, rc::Rc};
+
+        cx.update(crate::init);
+        let mut input = None;
+        let window = cx.open_window(size(px(400.), px(100.)), |window, cx| {
+            input = Some(
+                cx.new(|cx| crate::input::InputState::new(window, cx).default_value("한글 ok")),
+            );
+            gpui::EmptyView
+        });
+        let input = input.unwrap();
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let seen = events.clone();
+        let _subscription = cx.update(|cx| {
+            cx.subscribe(&input, move |_, event: &InputEvent, _| {
+                seen.borrow_mut().push(match event {
+                    InputEvent::PressEnter { .. } => "enter",
+                    InputEvent::Change => "change",
+                    InputEvent::Focus => "focus",
+                    InputEvent::Blur => "blur",
+                })
+            })
+        });
+
+        window
+            .update(cx, |_, window, cx| {
+                input.update(cx, |state, cx| {
+                    // "한글 ok": 5 UTF-16 units, 9 bytes.
+                    assert_eq!(state.text_length_utf16(window, cx), Some(5));
+                    assert_eq!(state.text_input_editable_range(window, cx), Some(0..5));
+
+                    state.set_selected_text_range(0..2, window, cx);
+                    assert_eq!(state.selected_range(), 0..6);
+                    // The platform deletes the selected syllables and re-inserts
+                    // the composed ones, as the iOS Korean keyboard does.
+                    state.replace_text_in_range(Some(0..2), "", window, cx);
+                    state.replace_text_in_range(None, "한", window, cx);
+                    state.replace_text_in_range(None, "글", window, cx);
+                    assert_eq!(state.text().to_string(), "한글 ok");
+
+                    // Return arrives as "\n": the Enter action, nothing inserted.
+                    state.replace_text_in_range(None, "\n", window, cx);
+                    assert_eq!(state.text().to_string(), "한글 ok");
+                    // A newline inside pasted text is still stripped (the caret
+                    // sits after 글, where the keyboard left it).
+                    state.replace_text_in_range(None, "a\nb", window, cx);
+                    assert_eq!(state.text().to_string(), "한글ab ok");
+
+                    // The app's own silent replaces behave as before: no Enter.
+                    state.insert("\r", window, cx);
+                    assert_eq!(state.text().to_string(), "한글ab ok");
+                    state.set_value("x\ny", window, cx);
+                    assert_eq!(state.text().to_string(), "xy");
+                    state.set_value("\n", window, cx);
+                    assert_eq!(state.text().to_string(), "");
+
+                    // Not editable: neither a length nor a range, so no keyboard.
+                    state.set_disabled(true, cx);
+                    assert_eq!(state.text_length_utf16(window, cx), None);
+                    assert_eq!(state.text_input_editable_range(window, cx), None);
+                    assert!(!state.text_input_configuration(window, cx).secure);
+                });
+            })
+            .unwrap();
+        assert_eq!(events.borrow().iter().filter(|e| **e == "enter").count(), 1);
+    }
+
+    /// A masked field is a secret whatever the host set.
+    #[gpui::test]
+    fn a_masked_field_asks_for_secure_entry(cx: &mut TestAppContext) {
+        use gpui::EntityInputHandler as _;
+
+        cx.update(crate::init);
+        let mut input = None;
+        let window = cx.open_window(size(px(400.), px(100.)), |window, cx| {
+            input = Some(cx.new(|cx| crate::input::InputState::new(window, cx).masked(true)));
+            gpui::EmptyView
+        });
+        let input = input.unwrap();
+        window
+            .update(cx, |_, window, cx| {
+                input.update(cx, |state, cx| {
+                    assert!(state.text_input_configuration(window, cx).secure);
+                    state.set_masked(false, window, cx);
+                    assert!(!state.text_input_configuration(window, cx).secure);
+                });
+            })
+            .unwrap();
     }
 
     #[gpui::test]
