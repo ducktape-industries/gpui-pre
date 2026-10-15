@@ -38,7 +38,7 @@ The crate has 29 `unsafe {}` blocks and (after the deletion above) no `unsafe im
 `// SAFETY:` comment, and zed's `[lints]` neither deny `unsafe_code` nor ask for
 `clippy::undocumented_unsafe_blocks`. They are not annotated here on purpose: the code is verbatim
 zed `a47f721832` and is refreshed from zed on every bump, so a comment on each block would be a
-source delta to carry forever. Instead the blocks were reviewed one by one on 2026-10-16
+source delta to carry forever. Instead the blocks were reviewed one by one on 2026-10-15
 (`wt/briefs/wasm-mobile/lanes/reviews/fork-29-31-opus.md`, section "#30 ... B. unsafe / FFI"), all
 sound as used: the `alloc().set_ivars()` + `msg_send![super(..), init|initWithFrame:]` pattern; the
 `resignFirstResponder` super call; `performSelector_withObject_afterDelay(sel!(reconcileTextInput), None, 0.0)`

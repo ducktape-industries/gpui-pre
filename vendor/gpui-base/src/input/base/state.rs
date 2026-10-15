@@ -1303,10 +1303,16 @@ impl<M: InputModeKind> InputBaseState<M> {
     }
 
     /// Tell the platform's text services now what changed, from inside a
-    /// platform-entry handler. An edit the keyboard itself made is filtered by
-    /// the backend there (gpui_ios's `native_edit`); an app-driven call to the
-    /// same method reaches them, as the core doc asks.
+    /// platform-entry handler, where the backend filters an edit the keyboard
+    /// itself made (gpui_ios's `native_edit`). The app's own edits (`insert`,
+    /// `replace`, `set_value`, `clean`: silent replaces) are left to the
+    /// element's per-frame `platform_sync`: one made inside a native call (a
+    /// `PressEnter` or `Change` subscriber clearing the field after a send)
+    /// would be dropped here as the keyboard's.
     fn tell_platform(&mut self, window: &Window) {
+        if self.silent_replace_text {
+            return;
+        }
         let (content, selection) = self.platform_sync();
         if content {
             window.notify_text_input_changed(&self.focus_handle);
@@ -4216,7 +4222,10 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
             && !new_text.is_empty()
             && new_text.chars().all(|c| c == '\n' || c == '\r')
         {
-            self.ime_marked_range = None;
+            // The composition's transaction closes as `unmark_text` closes it.
+            if self.ime_marked_range.take().is_some() {
+                self.undo_manager.commit_transaction();
+            }
             self.undo_manager.break_transaction_coalescing();
             if self.emit_events {
                 cx.emit(InputEvent::PressEnter {
@@ -4336,6 +4345,7 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
             if !self.silent_replace_text {
                 M::on_text_typed(self, &range, new_text, window, cx);
             }
+            self.tell_platform(window);
             return;
         }
 
@@ -5932,10 +5942,139 @@ mod tests {
                     assert_eq!(state.text_length_utf16(window, cx), None);
                     assert_eq!(state.text_input_editable_range(window, cx), None);
                     assert!(!state.text_input_configuration(window, cx).secure);
+                    state.set_disabled(false, cx);
+                    assert_eq!(state.text_length_utf16(window, cx), Some(0));
+                    state.set_readonly(true, cx);
+                    assert_eq!(state.text_length_utf16(window, cx), None);
+                    assert_eq!(state.text_input_editable_range(window, cx), None);
                 });
             })
             .unwrap();
         assert_eq!(events.borrow().iter().filter(|e| **e == "enter").count(), 1);
+    }
+
+    /// Every platform-entry handler tells the platform what it changed before
+    /// it returns, inside the backend's native-edit guard, so the element's
+    /// per-frame hook has nothing left to echo back to the keyboard. Single-
+    /// and multi-line.
+    #[gpui::test]
+    fn platform_handlers_leave_nothing_for_the_frame_hook(cx: &mut TestAppContext) {
+        use gpui::EntityInputHandler as _;
+
+        fn check<M: InputModeKind>(
+            input: &Entity<InputBaseState<M>>,
+            window: gpui::AnyWindowHandle,
+            cx: &mut TestAppContext,
+        ) {
+            window
+                .update(cx, |_, window, cx| {
+                    input.update(cx, |state, cx| {
+                        // A field never synced reports nothing: sync it first.
+                        state.platform_sync();
+                        let step = |state: &mut InputBaseState<M>, name: &str| {
+                            assert_eq!(state.platform_sync(), (false, false), "after {name}");
+                        };
+                        state.replace_text_in_range(None, "x", window, cx);
+                        step(state, "insertText");
+                        state.replace_and_mark_text_in_range(None, "に", None, window, cx);
+                        step(state, "setMarkedText");
+                        state.replace_text_in_range(None, "日", window, cx);
+                        step(state, "insertText committing a composition");
+                        state.replace_and_mark_text_in_range(None, "ほ", None, window, cx);
+                        step(state, "setMarkedText");
+                        state.unmark_text(window, cx);
+                        step(state, "unmarkText");
+                        state.set_selected_text_range(0..1, window, cx);
+                        step(state, "setSelectedTextRange");
+                        state.replace_text_in_range(Some(0..1), "", window, cx);
+                        step(state, "deleteBackward");
+                        assert_eq!(state.text().to_string(), "日ほab");
+                    });
+                })
+                .unwrap();
+        }
+
+        cx.update(crate::init);
+        let mut single = None;
+        let mut multi = None;
+        let window = cx.open_window(size(px(400.), px(100.)), |window, cx| {
+            single =
+                Some(cx.new(|cx| crate::input::InputState::new(window, cx).default_value("ab")));
+            multi =
+                Some(cx.new(|cx| crate::input::TextareaState::new(window, cx).default_value("ab")));
+            gpui::EmptyView
+        });
+        check(&single.unwrap(), window.into(), cx);
+        check(&multi.unwrap(), window.into(), cx);
+    }
+
+    /// An app edit made inside a native call (a `PressEnter` subscriber
+    /// clearing the field after a send) is left for the per-frame hook, which
+    /// runs outside the backend's native-edit guard and so reaches the keyboard.
+    #[gpui::test]
+    fn an_app_edit_inside_a_platform_call_reaches_the_frame_hook(cx: &mut TestAppContext) {
+        use gpui::EntityInputHandler as _;
+
+        cx.update(crate::init);
+        let mut input = None;
+        let window = cx.open_window(size(px(400.), px(100.)), |window, cx| {
+            input =
+                Some(cx.new(|cx| crate::input::InputState::new(window, cx).default_value("abc")));
+            gpui::EmptyView
+        });
+        let input = input.unwrap();
+        let _subscription = window
+            .update(cx, |_, window, cx| {
+                window.subscribe(&input, cx, |input, event: &InputEvent, window, cx| {
+                    if let InputEvent::PressEnter { .. } = event {
+                        input.update(cx, |state, cx| state.clean(window, cx));
+                    }
+                })
+            })
+            .unwrap();
+        window
+            .update(cx, |_, window, cx| {
+                input.update(cx, |state, cx| {
+                    state.platform_sync();
+                    state.replace_text_in_range(None, "\n", window, cx);
+                })
+            })
+            .unwrap();
+        let (text, (content_changed, _)) = input.update(cx, |state, _| {
+            (state.text().to_string(), state.platform_sync())
+        });
+        assert_eq!(text, "");
+        assert!(
+            content_changed,
+            "the cleared field is left for the frame hook"
+        );
+    }
+
+    /// Return in the middle of a composition ends it as `unmarkText` does: the
+    /// composed text is one undo step of its own.
+    #[gpui::test]
+    fn return_mid_composition_closes_its_undo_step(cx: &mut TestAppContext) {
+        use gpui::EntityInputHandler as _;
+
+        cx.update(crate::init);
+        let mut input = None;
+        let window = cx.open_window(size(px(400.), px(100.)), |window, cx| {
+            input = Some(cx.new(|cx| crate::input::InputState::new(window, cx)));
+            gpui::EmptyView
+        });
+        let input = input.unwrap();
+        window
+            .update(cx, |_, window, cx| {
+                input.update(cx, |state, cx| {
+                    state.replace_and_mark_text_in_range(None, "に", None, window, cx);
+                    state.replace_text_in_range(None, "\n", window, cx);
+                    state.replace_text_in_range(None, "a", window, cx);
+                    assert_eq!(state.text().to_string(), "にa");
+                    state.undo(&Undo, window, cx);
+                    assert_eq!(state.text().to_string(), "に");
+                });
+            })
+            .unwrap();
     }
 
     /// A masked field is a secret whatever the host set.

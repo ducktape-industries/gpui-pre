@@ -3,13 +3,13 @@
 Source: https://static.crates.io/crates/gpui-base/gpui-base-0.7.3.crate
 Archive SHA-256: `2e9955b6f4b048fd50ca15fc8e225d80bb00ba9ebc8fecdddde5ad26dbef9270`. Published sources
 and the Apache-2.0 license retained; upstream tests unchanged. longbridge's crate
-(`repository = github.com/longbridge/gpui-kit`); the one commit here is offered to them as a
-PR and this vendored copy goes when they ship it. Consumers patch it in with the other fork
+(`repository = github.com/longbridge/gpui-kit`); the change here is offered to them as a PR
+and this vendored copy goes when they ship it. Consumers patch it in with the other fork
 crates (`[patch.crates-io] gpui-base = { git = fork, rev }`); gpui-kit keeps its `=0.7.3`
 pin, which the patch satisfies.
 
-ONE commit, "input: the UIKit text contract" (`src/input/base/state.rs`,
-`src/input/base/element.rs`):
+One change, "input: the UIKit text contract" and its review fixes (`src/input/base/state.rs`,
+`src/input/base/element.rs`), offered upstream as one patch:
 
 iOS's keyboard is a `UITextInput` client that reads the document back and writes the
 selection on every keystroke (the Korean keyboard composes a syllable by inserting the jamo,
@@ -31,23 +31,29 @@ its own edits. Now:
    autocapitalize, suggestions, the Return key's action, and the fork's `virtual_keyboard` and
    `secure`, which the iOS backend maps onto `keyboardType` and `secureTextEntry`). A masked
    field answers `secure` whatever the host set. Default: gpui's default, as before.
-5. The platform-entry handlers (`replace_text_in_range`, `replace_and_mark_text_in_range`,
-   `unmark_text`, `set_selected_text_range`) tell the platform what they changed before they
-   return (`tell_platform`: a text generation counter and the selection against what was last
-   told), so the backend's own filter for edits the keyboard made (gpui_ios `native_edit`, set
-   only for the duration of the native call) applies, and an app's call to the same methods
-   (`insert`, `set_value`, `clean()` after a send) reaches native text services. The element
-   repeats the comparison once per frame for selection moves made outside those handlers.
+5. The platform-entry handlers (`replace_text_in_range`, on the single- and the multi-line
+   path, `replace_and_mark_text_in_range`, `unmark_text`, `set_selected_text_range`) tell the
+   platform what they changed before they return (`tell_platform`: a text generation counter
+   and the selection against what was last told), so the backend's own filter for edits the
+   keyboard made (gpui_ios `native_edit`, set only for the duration of the native call)
+   applies and the keyboard's edits are not echoed back to it. The app's own edits (`insert`,
+   `replace`, `set_value`, `clean()`: silent replaces) are not told from there, because one
+   made inside a native call (a `PressEnter` or `Change` subscriber clearing the field after
+   a send) would be dropped as the keyboard's. The element repeats the comparison once per
+   frame, outside any native call, and tells the platform about those and every other change
+   made outside the handlers (undo, key actions, a programmatic selection move).
 6. The software Return key arrives as inserted text `"\n"`, never as an Enter key event
    (S0-ios §3.3). A single-line field treats an inserted text that is only newlines as the
    Enter action (`InputEvent::PressEnter`, gated by `emit_events` like `Change`; a composition
-   in flight is cleared), and strips newlines from mixed text as before; the app's own silent
-   replaces (`insert`, `set_value`) are untouched, so `set_value("\n")` still clears the field;
-   a multi-line field keeps the newline. No single-line field ever holds a newline.
+   in flight ends as `unmark_text` ends it, its undo step closed), and strips newlines from
+   mixed text as before; the app's own silent replaces (`insert`, `set_value`) are untouched,
+   so `set_value("\n")` still clears the field; a multi-line field keeps the newline. No
+   single-line field ever holds a newline.
 
-Besides that commit's two source files and this README, `diff -rq` against the archive lists
-`examples/ios-input/` (four files): the on-target probe, gpui-base's `Input` under gpui_ios on the
-simulator, which the wasm-mobile Korean flows (`lanes/P/maestro`) type into; not part of the
-upstream patch.
+Besides those two source files and this README, `diff -rq` against the archive lists
+`examples/ios-input/` (four files): the on-target probe, gpui-base's `Input` (or, with
+`PROBE_TEXTAREA` set, its multi-line `Textarea`) under gpui_ios on the simulator, which the
+wasm-mobile Korean and Japanese flows (`lanes/P/maestro`) type into; not part of the upstream
+patch.
 
 Drop this vendored copy when the published crate carries the same.
