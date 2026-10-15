@@ -1,7 +1,7 @@
 use super::window::{IosWindowState, WindowReference};
 use gpui::{
     Autocapitalize, PlatformInputHandler, TextInputAction, TextInputConfiguration,
-    TextInputStateChange, px,
+    TextInputStateChange, VirtualKeyboard, px,
 };
 use objc2::rc::{Retained, Weak};
 use objc2::runtime::{AnyObject, ProtocolObject};
@@ -223,7 +223,19 @@ define_class!(
 
     unsafe impl UITextInputTraits for TextInputView {
         #[unsafe(method(keyboardType))]
-        fn keyboard_type(&self) -> UIKeyboardType { UIKeyboardType::Default }
+        fn keyboard_type(&self) -> UIKeyboardType {
+            match self.ivars().configuration.borrow().virtual_keyboard {
+                VirtualKeyboard::Text => UIKeyboardType::Default,
+                VirtualKeyboard::Numeric => UIKeyboardType::NumberPad,
+                VirtualKeyboard::Decimal => UIKeyboardType::DecimalPad,
+                VirtualKeyboard::Tel => UIKeyboardType::PhonePad,
+                VirtualKeyboard::Email => UIKeyboardType::EmailAddress,
+                VirtualKeyboard::Url => UIKeyboardType::URL,
+                VirtualKeyboard::Search => UIKeyboardType::WebSearch,
+            }
+        }
+        #[unsafe(method(isSecureTextEntry))]
+        fn is_secure_text_entry(&self) -> bool { self.ivars().configuration.borrow().secure }
         #[unsafe(method(autocorrectionType))]
         fn autocorrection_type(&self) -> UITextAutocorrectionType {
             if self.ivars().configuration.borrow().autocorrect { UITextAutocorrectionType::Yes } else { UITextAutocorrectionType::No }
@@ -882,7 +894,11 @@ pub(super) mod tests {
             autocapitalize: Autocapitalize::Sentences,
             suggestions: true,
             input_action: TextInputAction::Search,
+            virtual_keyboard: VirtualKeyboard::Email,
+            secure: true,
         });
+        assert_eq!(view.keyboardType(), UIKeyboardType::EmailAddress);
+        assert!(view.isSecureTextEntry());
         assert_eq!(view.autocorrectionType(), UITextAutocorrectionType::Yes);
         assert_eq!(
             view.autocapitalizationType(),

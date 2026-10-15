@@ -2515,6 +2515,39 @@ pub struct TextInputConfiguration {
     pub suggestions: bool,
     /// The action advertised on a software keyboard's confirm ("enter") key.
     pub input_action: TextInputAction,
+    /// The kind of software keyboard the field asks for.
+    pub virtual_keyboard: VirtualKeyboard,
+    /// Whether the field holds a secret (a password, a recovery phrase): the
+    /// platform then hides what is typed from third-party keyboards, suggestion
+    /// and learning services, and shows it masked in its own UI (iOS
+    /// `secureTextEntry`).
+    pub secure: bool,
+}
+
+/// The kind of software keyboard a field asks for.
+///
+/// The variants are the HTML `inputmode` attribute's value set
+/// (<https://html.spec.whatwg.org/multipage/interaction.html#input-modalities:-the-inputmode-attribute>),
+/// which also maps onto iOS's `UIKeyboardType` and Android's `InputType`;
+/// [`VirtualKeyboard::Text`] is the platform's default keyboard. A hint only:
+/// the platform may still deliver any text.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum VirtualKeyboard {
+    /// The default keyboard for text.
+    #[default]
+    Text,
+    /// Digits only.
+    Numeric,
+    /// Digits and a decimal separator.
+    Decimal,
+    /// A telephone keypad.
+    Tel,
+    /// A keyboard laid out for email addresses.
+    Email,
+    /// A keyboard laid out for URLs.
+    Url,
+    /// A keyboard whose confirm key searches.
+    Search,
 }
 
 /// Automatic capitalization applied by software keyboards.
