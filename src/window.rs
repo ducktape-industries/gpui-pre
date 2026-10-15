@@ -3015,6 +3015,16 @@ impl Window {
         self.platform_window.set_bounds(bounds);
     }
 
+    /// Let the person resize the window, or fix it at its current size: no
+    /// resize edges, no zoom from a title bar double-click, and on macOS no
+    /// zoom or full-screen button. [`Self::resize`] and [`Self::set_bounds`]
+    /// still size a fixed window, and it stays fixed at the size they give
+    /// it. Implemented on macOS, X11 and Wayland.
+    pub fn set_resizable(&mut self, resizable: bool) {
+        self.is_resizable = resizable;
+        self.platform_window.set_resizable(resizable);
+    }
+
     /// Returns whether or not the window is currently fullscreen
     pub fn is_fullscreen(&self) -> bool {
         self.platform_window.is_fullscreen()
@@ -8187,6 +8197,20 @@ mod tests {
         TouchId, TouchPhase, Underline, UnderlineStyle, Window, WindowAppearance, WindowOptions,
         canvas, div, hsla, point, px, size,
     };
+
+    #[gpui::test]
+    fn set_resizable_fixes_the_window_and_lets_it_go(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| EmptyView);
+        window
+            .update(cx, |_, window, _| {
+                assert!(window.is_resizable());
+                window.set_resizable(false);
+                assert!(!window.is_resizable());
+                window.set_resizable(true);
+                assert!(window.is_resizable());
+            })
+            .unwrap();
+    }
 
     #[cfg(feature = "profiler")]
     #[gpui::test]

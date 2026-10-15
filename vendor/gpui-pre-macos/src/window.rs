@@ -1458,6 +1458,18 @@ impl PlatformWindow for MacWindow {
             .detach();
     }
 
+    fn set_resizable(&mut self, resizable: bool) {
+        unsafe {
+            let window = self.0.lock().native_window;
+            let mut style_mask = window.styleMask();
+            style_mask.set(NSWindowStyleMask::NSResizableWindowMask, resizable);
+            window.setStyleMask_(style_mask);
+        }
+        // Changing the style mask resets the traffic light position, as a
+        // title does, so we have to move it again.
+        self.0.lock().move_traffic_light();
+    }
+
     fn set_bounds(&mut self, bounds: Bounds<Pixels>) {
         let this = self.0.lock();
         let window = this.native_window;

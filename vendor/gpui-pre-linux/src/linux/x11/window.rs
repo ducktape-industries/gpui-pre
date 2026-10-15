@@ -293,6 +293,13 @@ pub struct X11WindowState {
     pub handle: AnyWindowHandle,
     last_insets: [u32; 4],
     accesskit_adapter: Option<accesskit_unix::Adapter>,
+    /// Whether the person may resize the window; a fixed one carries its
+    /// size as both its minimum and its maximum.
+    resizable: bool,
+    /// What a resizable window's WM_NORMAL_HINTS carry: the minimum it was
+    /// opened with and the GPU's maximum texture side.
+    min_size: Option<Size<Pixels>>,
+    max_texture_size: u32,
 }
 
 impl X11WindowState {
@@ -306,6 +313,32 @@ impl X11WindowState {
             renderer.update_transparency(is_transparent);
         }
     }
+
+    /// The WM_NORMAL_HINTS the window carries at `size`.
+    fn size_hints(&self, size: Size<DevicePixels>) -> WmSizeHints {
+        size_hints(self.resizable, size, self.min_size, self.max_texture_size)
+    }
+}
+
+/// WM_NORMAL_HINTS: a resizable window's minimum (in logical pixels, as
+/// upstream sets it) and the GPU's maximum texture side, or a fixed one's
+/// `size` both ways, so the window manager offers no resize.
+fn size_hints(
+    resizable: bool,
+    size: Size<DevicePixels>,
+    min_size: Option<Size<Pixels>>,
+    max_texture_size: u32,
+) -> WmSizeHints {
+    let mut hints = WmSizeHints::new();
+    if resizable {
+        hints.min_size =
+            min_size.map(|size| (f32::from(size.width) as i32, f32::from(size.height) as i32));
+        hints.max_size = Some((max_texture_size as i32, max_texture_size as i32));
+    } else {
+        hints.min_size = Some((size.width.0, size.height.0));
+        hints.max_size = hints.min_size;
+    }
+    hints
 }
 
 #[derive(Clone)]
@@ -784,13 +817,8 @@ impl X11WindowState {
 
             // Set max window size hints based on the GPU's maximum texture dimension.
             // This prevents the window from being resized larger than what the GPU can render.
+            // A window that is not resizable is fixed at its size instead.
             let max_texture_size = renderer.max_texture_size();
-            let mut size_hints = WmSizeHints::new();
-            if let Some(size) = params.window_min_size {
-                size_hints.min_size =
-                    Some((f32::from(size.width) as i32, f32::from(size.height) as i32));
-            }
-            size_hints.max_size = Some((max_texture_size as i32, max_texture_size as i32));
             check_reply(
                 || {
                     format!(
@@ -798,7 +826,13 @@ impl X11WindowState {
                         max_texture_size
                     )
                 },
-                size_hints.set_normal_hints(xcb, x_window),
+                size_hints(
+                    params.is_resizable,
+                    bounds.size,
+                    params.window_min_size,
+                    max_texture_size,
+                )
+                .set_normal_hints(xcb, x_window),
             )?;
 
             if let Some(image) = params.icon {
@@ -859,6 +893,9 @@ impl X11WindowState {
                 accesskit_adapter: None,
                 counter_id: sync_request_counter,
                 last_sync_counter: None,
+                resizable: params.is_resizable,
+                min_size: params.window_min_size,
+                max_texture_size,
             })
         });
 
@@ -919,6 +956,20 @@ enum WmHintPropertyState {
 }
 
 impl X11Window {
+    /// Writes the WM_NORMAL_HINTS the window carries at `size`. A fixed
+    /// window is fixed at the size it is given: `resize` and `set_bounds`
+    /// write these before they ask for the size, so the window manager never
+    /// holds a fixed window to its old one.
+    fn set_size_hints(&self, size: Size<DevicePixels>) {
+        let hints = self.0.state.borrow().size_hints(size);
+        check_reply(
+            || "X11 change of WM_SIZE_HINTS failed.",
+            hints.set_normal_hints(&self.0.xcb, self.0.x_window),
+        )
+        .log_err();
+        xcb_flush(&self.0.xcb);
+    }
+
     pub fn new(
         handle: AnyWindowHandle,
         client: X11ClientStatePtr,
@@ -1467,6 +1518,9 @@ impl PlatformWindow for X11Window {
     fn resize(&mut self, size: Size<Pixels>) {
         let state = self.0.state.borrow();
         let size = size.to_device_pixels(state.scale_factor);
+        if !state.resizable {
+            self.set_size_hints(size);
+        }
         let width = size.width.0 as u32;
         let height = size.height.0 as u32;
 
@@ -1494,6 +1548,9 @@ impl PlatformWindow for X11Window {
             (state.scale_factor, state.atoms._NET_FRAME_EXTENTS)
         };
         let bounds = bounds.to_device_pixels(scale_factor);
+        if !self.0.state.borrow().resizable {
+            self.set_size_hints(bounds.size);
+        }
         // `bounds` reports where the client sits, but a reparenting window
         // manager puts its frame at the requested x/y (NorthWest gravity):
         // step back by the frame's left and top edges
@@ -1533,6 +1590,15 @@ impl PlatformWindow for X11Window {
         )
         .log_err();
         xcb_flush(&self.0.xcb);
+    }
+
+    fn set_resizable(&mut self, resizable: bool) {
+        let size = {
+            let mut state = self.0.state.borrow_mut();
+            state.resizable = resizable;
+            state.bounds.size.to_device_pixels(state.scale_factor)
+        };
+        self.set_size_hints(size);
     }
 
     fn scale_factor(&self) -> f32 {
