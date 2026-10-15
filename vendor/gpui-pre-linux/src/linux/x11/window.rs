@@ -19,7 +19,7 @@ use x11rb::{
     connection::Connection,
     cookie::{Cookie, VoidCookie},
     errors::ConnectionError,
-    properties::{WmHints, WmSizeHints},
+    properties::{WmHints, WmSizeHints, WmSizeHintsSpecification},
     protocol::{
         sync,
         xinput::{self, ConnectionExt as _},
@@ -322,7 +322,10 @@ impl X11WindowState {
 
 /// WM_NORMAL_HINTS: a resizable window's minimum (in logical pixels, as
 /// upstream sets it) and the GPU's maximum texture side, or a fixed one's
-/// `size` both ways, so the window manager offers no resize.
+/// `size` both ways, so the window manager offers no resize. Static gravity:
+/// the x/y the window asks for name where its client area sits, not its
+/// frame, so a window opened or moved to the origin `bounds` reported comes
+/// back where it was.
 fn size_hints(
     resizable: bool,
     size: Size<DevicePixels>,
@@ -330,6 +333,7 @@ fn size_hints(
     max_texture_size: u32,
 ) -> WmSizeHints {
     let mut hints = WmSizeHints::new();
+    hints.win_gravity = Some(xproto::Gravity::STATIC);
     if resizable {
         hints.min_size =
             min_size.map(|size| (f32::from(size.width) as i32, f32::from(size.height) as i32));
@@ -574,7 +578,7 @@ impl X11WindowState {
                     visual.depth,
                     x_window,
                     visual_set.root,
-                    bounds.origin.x.0 + 2,
+                    bounds.origin.x.0,
                     bounds.origin.y.0,
                     bounds.size.width.0,
                     bounds.size.height.0
@@ -584,7 +588,7 @@ impl X11WindowState {
                 visual.depth,
                 x_window,
                 visual_set.root,
-                (bounds.origin.x.0 + 2) as i16,
+                bounds.origin.x.0 as i16,
                 bounds.origin.y.0 as i16,
                 bounds.size.width.0 as u16,
                 bounds.size.height.0 as u16,
@@ -826,12 +830,22 @@ impl X11WindowState {
                         max_texture_size
                     )
                 },
-                size_hints(
-                    params.is_resizable,
-                    bounds.size,
-                    params.window_min_size,
-                    max_texture_size,
-                )
+                {
+                    // the position the window opens at is the program's:
+                    // without it the window manager places it itself
+                    let mut hints = size_hints(
+                        params.is_resizable,
+                        bounds.size,
+                        params.window_min_size,
+                        max_texture_size,
+                    );
+                    hints.position = Some((
+                        WmSizeHintsSpecification::ProgramSpecified,
+                        bounds.origin.x.0,
+                        bounds.origin.y.0,
+                    ));
+                    hints
+                }
                 .set_normal_hints(xcb, x_window),
             )?;
 
@@ -1543,35 +1557,14 @@ impl PlatformWindow for X11Window {
     }
 
     fn set_bounds(&mut self, bounds: Bounds<Pixels>) {
-        let (scale_factor, frame_extents) = {
-            let state = self.0.state.borrow();
-            (state.scale_factor, state.atoms._NET_FRAME_EXTENTS)
-        };
+        let scale_factor = self.0.state.borrow().scale_factor;
         let bounds = bounds.to_device_pixels(scale_factor);
         if !self.0.state.borrow().resizable {
             self.set_size_hints(bounds.size);
         }
-        // `bounds` reports where the client sits, but a reparenting window
-        // manager puts its frame at the requested x/y (NorthWest gravity):
-        // step back by the frame's left and top edges
-        let (left, top) = get_reply(
-            || "X11 GetProperty for _NET_FRAME_EXTENTS failed.",
-            self.0.xcb.get_property(
-                false,
-                self.0.x_window,
-                frame_extents,
-                xproto::AtomEnum::CARDINAL,
-                0,
-                4,
-            ),
-        )
-        .ok()
-        .and_then(|reply| {
-            let edges: Vec<u32> = reply.value32()?.collect();
-            (edges.len() == 4).then(|| (edges[0] as i32, edges[2] as i32))
-        })
-        .unwrap_or_default();
-        let (x, y) = (bounds.origin.x.0 - left, bounds.origin.y.0 - top);
+        // `bounds` reports where the client sits, and the window's static
+        // gravity puts the client (not its frame) at the requested x/y
+        let (x, y) = (bounds.origin.x.0, bounds.origin.y.0);
         let (width, height) = (bounds.size.width.0 as u32, bounds.size.height.0 as u32);
         check_reply(
             || {
