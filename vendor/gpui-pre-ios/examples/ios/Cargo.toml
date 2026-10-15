@@ -1,0 +1,22 @@
+# Zed's gpui_ios smoke example, built against this fork. Standalone package: the
+# fork is a crate, not a workspace, so the gpui-pre crates are patched by path.
+[package]
+name = "gpui_ios_example"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "Apache-2.0"
+
+[[bin]]
+name = "gpui_ios_example"
+path = "src/gpui_ios_example.rs"
+test = false
+bench = false
+
+[target.'cfg(target_os = "ios")'.dependencies]
+gpui = { package = "gpui-pre", version = "=0.3.9", default-features = false }
+gpui_ios = { package = "gpui-pre-ios", path = "../.." }
+
+[patch.crates-io]
+gpui-pre = { path = "../../../.." }
+gpui-pre-scheduler = { path = "../../../gpui-pre-scheduler" }
