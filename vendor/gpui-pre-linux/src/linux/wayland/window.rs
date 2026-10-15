@@ -140,6 +140,13 @@ pub struct WaylandWindowState {
     window_controls: WindowControls,
     client_inset: Option<Pixels>,
     accesskit_adapter: Option<accesskit_unix::Adapter>,
+    /// Whether the person may resize the window; a fixed one asks its
+    /// geometry as both its minimum and its maximum size.
+    resizable: bool,
+    /// What a resizable window asks: the minimum it was opened with and the
+    /// GPU's maximum texture side.
+    min_size: Option<Size<Pixels>>,
+    max_texture_size: i32,
 }
 
 pub enum WaylandSurfaceState {
@@ -595,16 +602,13 @@ impl WaylandWindowState {
             if let Some(app_id) = options.app_id.as_ref() {
                 xdg_state.toplevel.set_app_id(app_id.clone());
             }
-
-            // Set max window size based on the GPU's maximum texture dimension.
-            // This prevents the window from being resized larger than what the GPU can render.
-            let max_texture_size = renderer.max_texture_size() as i32;
-            xdg_state
-                .toplevel
-                .set_max_size(max_texture_size, max_texture_size);
         }
 
-        Ok(Self {
+        // Set max window size based on the GPU's maximum texture dimension.
+        // This prevents the window from being resized larger than what the GPU can render.
+        let max_texture_size = renderer.max_texture_size() as i32;
+
+        let state = Self {
             surface_state,
             parent,
             children: FxHashMap::default(),
@@ -640,7 +644,47 @@ impl WaylandWindowState {
             window_controls: WindowControls::default(),
             client_inset: None,
             accesskit_adapter: None,
-        })
+            resizable: options.is_resizable,
+            min_size: options.window_min_size,
+            max_texture_size,
+        };
+        // no decoration inset is known yet: the requested size is the geometry
+        state.set_size_limits(options.bounds.size.map(|v| f32::from(v) as i32));
+        Ok(state)
+    }
+
+    /// The window geometry (surface-local, client-side decoration insets left
+    /// out) of a window whose content is `size`.
+    fn window_geometry(&self, size: Size<Pixels>) -> Bounds<i32> {
+        inset_by_tiling(
+            Bounds {
+                origin: Point::default(),
+                size,
+            },
+            self.inset(),
+            self.tiling,
+        )
+        .map(|v| f32::from(v) as i32)
+        .map_size(|v| if v <= 0 { 1 } else { v })
+    }
+
+    /// The toplevel's minimum and maximum size, applied at the surface's next
+    /// commit: a resizable window's minimum and the GPU's maximum, or a fixed
+    /// one's `geometry` both ways, so the compositor offers no resize.
+    fn set_size_limits(&self, geometry: Size<i32>) {
+        let Some(toplevel) = self.surface_state.toplevel() else {
+            return;
+        };
+        if self.resizable {
+            let min = self.min_size.map_or((0, 0), |size| {
+                (f32::from(size.width) as i32, f32::from(size.height) as i32)
+            });
+            toplevel.set_min_size(min.0, min.1);
+            toplevel.set_max_size(self.max_texture_size, self.max_texture_size);
+        } else {
+            toplevel.set_min_size(geometry.width, geometry.height);
+            toplevel.set_max_size(geometry.width, geometry.height);
+        }
     }
 
     pub fn is_transparent(&self) -> bool {
@@ -1782,16 +1826,11 @@ impl PlatformWindow for WaylandWindow {
         // Keep window geometry consistent with configure handling. On Wayland, window geometry is
         // surface-local: resizing should not attempt to translate the window; the compositor
         // controls placement. We also account for client-side decoration insets and tiling.
-        let window_geometry = inset_by_tiling(
-            Bounds {
-                origin: Point::default(),
-                size,
-            },
-            state.inset(),
-            state.tiling,
-        )
-        .map(|v| f32::from(v) as i32)
-        .map_size(|v| if v <= 0 { 1 } else { v });
+        let window_geometry = state.window_geometry(size);
+        // a fixed window is fixed at the size it is given
+        if !state.resizable {
+            state.set_size_limits(window_geometry.size);
+        }
 
         state.surface_state.set_geometry(
             window_geometry.origin.x,
@@ -2118,6 +2157,16 @@ impl PlatformWindow for WaylandWindow {
                 edge.to_xdg(),
             )
         }
+    }
+
+    fn set_resizable(&mut self, resizable: bool) {
+        let mut state = self.borrow_mut();
+        state.resizable = resizable;
+        let geometry = state.window_geometry(state.bounds.size);
+        state.set_size_limits(geometry.size);
+        // Commit to apply it immediately, otherwise it only takes effect
+        // on the next frame.
+        state.surface.commit();
     }
 
     fn set_exclusive_zone(&self, zone: Pixels) {

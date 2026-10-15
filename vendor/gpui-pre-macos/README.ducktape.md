@@ -7,6 +7,12 @@ One addition: `PlatformWindow::set_bounds`, which gpui-pre declares with a
 resize-only default. `MacWindow` overrides it with `setFrame:display:`, converting the top-left bounds on the window's screen back to AppKit's bottom-left frame (the inverse of `bounds`).
 Drop this vendored copy when the locked upstream release can move a window.
 
+`PlatformWindow::set_resizable` (gpui-pre declares it, doing nothing):
+`MacWindow` toggles `NSResizableWindowMask` in the window's style mask, then
+moves the traffic lights back, as `set_title` does. See the fork README's
+"Fixing a window's size". Drop it when the locked upstream release can fix a
+window's size at run time.
+
 AccessKit 0.25 (`Cargo.toml` only): `accesskit` 0.24.0 → 0.25.1 and
 `accesskit_macos` 0.26.0 → 0.27.1 (the same `accesskit` as gpui-pre; it
 also changes what VoiceOver reads: sub-roles, labels as values for some roles,

@@ -1226,6 +1226,10 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn set_bounds(&mut self, bounds: Bounds<Pixels>) {
         self.resize(bounds.size);
     }
+    /// Lets the person resize the window, or fixes it at its current size.
+    /// [`Self::resize`] and [`Self::set_bounds`] still size a fixed window,
+    /// and it stays fixed at the size they give it. The default does nothing.
+    fn set_resizable(&mut self, _resizable: bool) {}
     fn scale_factor(&self) -> f32;
     fn appearance(&self) -> WindowAppearance;
     fn display(&self) -> Option<Rc<dyn PlatformDisplay>>;

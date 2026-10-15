@@ -7,6 +7,15 @@ One addition: `PlatformWindow::set_bounds`, which gpui-pre declares with a
 resize-only default. `X11Window` overrides it with one `ConfigureWindow` carrying x, y, width and height. Wayland keeps the trait default (size only): its clients can't position their windows.
 Drop this vendored copy when the locked upstream release can move a window.
 
+`PlatformWindow::set_resizable` (gpui-pre declares it, doing nothing): X11
+writes `WM_NORMAL_HINTS` with the window's size as both minimum and maximum
+while it is fixed, the opening minimum and the GPU's maximum otherwise, and
+honours `WindowParams::is_resizable` when the window opens (upstream never
+read it); a fixed window's `resize` and `set_bounds` write the new size first.
+Wayland sets the `xdg_toplevel` minimum and maximum the same way, from the
+window geometry, and commits. See the fork README's "Fixing a window's size".
+Drop it when the locked upstream release can fix a window's size at run time.
+
 A held key's repeat: X11 sends it as one more `KeyPress`, which upstream
 reported with `is_held: false`. The client now asks XKB for detectable
 auto-repeat at connect, so the server sends no release before each repeat
