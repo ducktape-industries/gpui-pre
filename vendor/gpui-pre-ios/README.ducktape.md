@@ -25,6 +25,9 @@ appears.
   the bounds (`PlatformDisplay: Debug` only; every use is `Rc<dyn PlatformDisplay>` on the main
   thread), so the two lines only let safe code move a `UIScreen` off the main thread. Two lines
   fewer, no other change.
+- `src/ios/text_input.rs`: `keyboardType` answers the fork's `TextInputConfiguration::virtual_keyboard`
+  (`VirtualKeyboard` -> `UIKeyboardType`; zed answers `Default` always) and `isSecureTextEntry`
+  answers its `secure` (zed has neither), and the harness test asserts both.
 - this file.
 
 The rest of `src/` and `tests/` is verbatim.
