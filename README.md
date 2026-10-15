@@ -281,6 +281,17 @@ their `README.ducktape.md`). Wayland and Windows keep the trait default, which
 only resizes. Consumers patch `gpui-pre-linux` and `gpui-pre-macos` from the
 same revision as `gpui-pre`.
 
+On X11 a window also opens where `WindowOptions::window_bounds` puts it.
+Upstream wrote no position into `WM_NORMAL_HINTS`, so the window manager
+placed every window itself (openbox: a window asked at 300,200 opened at
+640,307), and created it 2 px right of the asked x. The vendored backend
+creates it at the asked origin, writes that origin as a program-specified
+position, and gives the window static gravity: the x/y name where the
+client area sits, which is what `Window::bounds` reports, so a window
+reopened or moved to bounds it reported comes back there with no frame-sized
+drift (`set_bounds` no longer steps back by `_NET_FRAME_EXTENTS`). Checked
+by hand on Xvfb + openbox (see the PR).
+
 ### Fixing a window's size
 
 `Window::set_resizable(bool)` lets the person resize a window, or fixes it at

@@ -7,6 +7,15 @@ One addition: `PlatformWindow::set_bounds`, which gpui-pre declares with a
 resize-only default. `X11Window` overrides it with one `ConfigureWindow` carrying x, y, width and height. Wayland keeps the trait default (size only): its clients can't position their windows.
 Drop this vendored copy when the locked upstream release can move a window.
 
+A window opens where it is asked: `X11WindowState::new` creates it at
+`WindowParams::bounds`' origin (upstream added 2 to x), writes that origin
+into `WM_NORMAL_HINTS` as a program-specified position (upstream wrote none,
+so the window manager placed it), and every `WM_NORMAL_HINTS` it writes
+carries static gravity, so the requested x/y place the client area, not the
+frame, in the coordinates `bounds` reports. `set_bounds` sends its x/y as
+they are (it stepped back by `_NET_FRAME_EXTENTS` for the default northwest
+gravity before). See the fork README's "Moving a window".
+
 `PlatformWindow::set_resizable` (gpui-pre declares it, doing nothing): X11
 writes `WM_NORMAL_HINTS` with the window's size as both minimum and maximum
 while it is fixed, the opening minimum and the GPU's maximum otherwise, and
