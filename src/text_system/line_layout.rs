@@ -941,26 +941,74 @@ fn apply_force_width_to_layout(layout: &mut LineLayout, force_width: Pixels) {
     }
 }
 
-/// Letter spacing, on the shaped line so every platform's shaper gets the same: each glyph the
-/// pen advances past gets `spacing` more, the line's last glyph included, so a line of `n`
-/// glyphs is `n * spacing` wider, and wrapping and hit testing, which read these positions, agree.
-/// A glyph shaped at the x of the one before it (a combining mark on its base) is not advanced
-/// past, so it stays on that glyph.
+/// Letter spacing, applied to the shaped line by one rule for every platform's shaper.
+///
+/// The spacing goes after each glyph the pen advances past: one whose next glyph lies right of
+/// it, and the last glyph when it is the rightmost and the line ends right of it. Every glyph
+/// moves by the spacings before it and the width grows by all of them, so wrapping and hit
+/// testing, which read these positions, agree with the width.
+///
+/// A glyph the pen does not advance past (a combining mark, a zero-width character) keeps its
+/// base's place. In a left-to-right run both shapers put a mark after its base, at the base's
+/// end: cosmic-text with the base's text index, CoreText with its own, later one. In a
+/// right-to-left run laid out left to right they put it before its base, at the base's x, with
+/// an index no earlier than the base's. A ligature is one glyph, so one spacing. Glyphs a shaper
+/// gives right to left (cosmic-text, for a paragraph that starts right to left) are passed by no
+/// pen move and stay as shaped.
 fn apply_letter_spacing(layout: &mut LineLayout, spacing: Pixels) {
-    let mut shift = px(0.);
-    let mut shaped_x_before = None;
-    for glyph in layout.runs.iter_mut().flat_map(|run| run.glyphs.iter_mut()) {
-        let shaped_x = glyph.position.x;
-        if shaped_x_before.is_some_and(|before| shaped_x > before) {
-            shift += spacing;
+    let shaped: Vec<(Pixels, usize)> = layout
+        .runs
+        .iter()
+        .flat_map(|run| &run.glyphs)
+        .map(|glyph| (glyph.position.x, glyph.index))
+        .collect();
+    let Some(&(last_x, _)) = shaped.last() else {
+        return;
+    };
+    let last_is_rightmost = shaped.iter().all(|&(x, _)| x <= last_x);
+    let advances: Vec<bool> = (0..shaped.len())
+        .map(|i| match shaped.get(i + 1) {
+            Some(&(next_x, _)) => next_x > shaped[i].0,
+            None => last_is_rightmost && layout.width > last_x,
+        })
+        .collect();
+    // the text index of the next glyph after each one that the pen advances past
+    let mut next_advancing = vec![None; shaped.len()];
+    for i in (0..shaped.len() - 1).rev() {
+        next_advancing[i] = if advances[i + 1] {
+            Some(shaped[i + 1].1)
+        } else {
+            next_advancing[i + 1]
+        };
+    }
+
+    let mut shifts: Vec<Pixels> = Vec::with_capacity(shaped.len());
+    let mut passed = px(0.);
+    for (i, &(_, index)) in shaped.iter().enumerate() {
+        // a glyph the pen stops on after its base (the next one it passes comes later in the
+        // text) takes its base's shift; one before its base already has it, as no spacing lies
+        // between them
+        let after_its_base =
+            !advances[i] && i > 0 && next_advancing[i].is_none_or(|next| next > index);
+        let shift = if after_its_base {
+            shifts[i - 1]
+        } else {
+            passed
+        };
+        shifts.push(shift);
+        if advances[i] {
+            passed += spacing;
         }
-        shaped_x_before = Some(shaped_x);
+    }
+    for (glyph, shift) in layout
+        .runs
+        .iter_mut()
+        .flat_map(|run| &mut run.glyphs)
+        .zip(shifts)
+    {
         glyph.position.x += shift;
     }
-    if shaped_x_before.is_some_and(|before| layout.width > before) {
-        shift += spacing;
-    }
-    layout.width += shift;
+    layout.width += passed;
 }
 
 /// A run of text with a single font.
@@ -1267,16 +1315,53 @@ mod tests {
         assert_eq!(format!("{laid_out:?}"), format!("{shaper:?}"));
     }
 
+    // The glyph streams below are what cosmic-text 0.19 (DejaVu Sans) and CoreText (Helvetica,
+    // its Hebrew fallback) gave for these lines at 16px, positions rounded.
+
     #[test]
-    fn letter_spacing_keeps_a_combining_mark_on_its_base() {
-        // Thai "กี" then a base: the mark is shaped at its base's x
-        let mut layout = make_layout(vec![glyph_at(0., 0), glyph_at(0., 3), glyph_at(8., 6)]);
-        layout.width = px(16.);
+    fn letter_spacing_keeps_a_combining_mark_with_its_base() {
+        // cosmic-text, "q\u{301}x": the mark at its base's end, with its base's index
+        let mut cosmic = make_layout(vec![glyph_at(0., 0), glyph_at(10., 0), glyph_at(10., 3)]);
+        cosmic.width = px(20.);
+        apply_letter_spacing(&mut cosmic, px(2.));
+        assert_eq!(glyph_x_positions(&cosmic), [0., 10., 12.]);
+        assert_eq!(cosmic.width, px(24.));
 
+        // CoreText, "ab\u{301}\u{301}c": each mark at its base's end, with an index of its own
+        let mut core_text = make_layout(vec![
+            glyph_at(0., 0),
+            glyph_at(9., 1),
+            glyph_at(18., 2),
+            glyph_at(18., 4),
+            glyph_at(18., 6),
+        ]);
+        core_text.width = px(26.);
+        apply_letter_spacing(&mut core_text, px(2.));
+        assert_eq!(glyph_x_positions(&core_text), [0., 11., 20., 20., 22.]);
+        assert_eq!(core_text.width, px(32.));
+
+        // a right-to-left run in a left-to-right line, "a" then a pointed shin: both shapers
+        // put the point before its base, at the base's x (CoreText with its own, later index)
+        let mut rtl_run = make_layout(vec![glyph_at(0., 0), glyph_at(10., 3), glyph_at(10., 1)]);
+        rtl_run.width = px(20.);
+        apply_letter_spacing(&mut rtl_run, px(2.));
+        assert_eq!(glyph_x_positions(&rtl_run), [0., 12., 12.]);
+        assert_eq!(rtl_run.width, px(24.));
+    }
+
+    #[test]
+    fn letter_spacing_leaves_glyphs_given_right_to_left_as_shaped() {
+        // cosmic-text gives a right-to-left paragraph's glyphs right to left: "שלום"
+        let mut layout = make_layout(vec![
+            glyph_at(24., 0),
+            glyph_at(15., 2),
+            glyph_at(11., 4),
+            glyph_at(0., 6),
+        ]);
+        layout.width = px(35.);
         apply_letter_spacing(&mut layout, px(2.));
-
-        assert_eq!(glyph_x_positions(&layout), [0., 0., 10.]);
-        assert_eq!(layout.width, px(20.));
+        assert_eq!(glyph_x_positions(&layout), [24., 15., 11., 0.]);
+        assert_eq!(layout.width, px(35.));
     }
 
     #[test]

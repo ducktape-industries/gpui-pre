@@ -481,8 +481,8 @@ pub struct TextStyle {
     /// The number of lines to display before truncating the text
     pub line_clamp: Option<usize>,
 
-    /// Extra space after each letter, as CSS `letter-spacing`; applied to the shaped line, so it
-    /// is the same on every platform. `None` keeps the shaper's own spacing.
+    /// Extra space after each letter, as CSS `letter-spacing`; applied to the shaped line by one
+    /// rule for every platform. `None` keeps the shaper's own spacing.
     pub letter_spacing: Option<Pixels>,
 }
 
