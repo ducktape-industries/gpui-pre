@@ -2282,7 +2282,12 @@ impl WgpuRenderer {
 
 #[cfg(all(
     not(target_family = "wasm"),
-    any(test, feature = "bench-support", feature = "test-support")
+    any(
+        test,
+        feature = "bench-support",
+        feature = "test-support",
+        feature = "offscreen"
+    )
 ))]
 struct HeadlessRenderTarget {
     texture: wgpu::Texture,
@@ -2291,7 +2296,12 @@ struct HeadlessRenderTarget {
 
 #[cfg(all(
     not(target_family = "wasm"),
-    any(test, feature = "bench-support", feature = "test-support")
+    any(
+        test,
+        feature = "bench-support",
+        feature = "test-support",
+        feature = "offscreen"
+    )
 ))]
 impl HeadlessRenderTarget {
     fn size(&self) -> Size<DevicePixels> {
@@ -2304,7 +2314,12 @@ impl HeadlessRenderTarget {
 
 #[cfg(all(
     not(target_family = "wasm"),
-    any(test, feature = "bench-support", feature = "test-support")
+    any(
+        test,
+        feature = "bench-support",
+        feature = "test-support",
+        feature = "offscreen"
+    )
 ))]
 pub struct WgpuHeadlessRenderer {
     context: WgpuContext,
@@ -2315,11 +2330,71 @@ pub struct WgpuHeadlessRenderer {
 
 #[cfg(all(
     not(target_family = "wasm"),
-    any(test, feature = "bench-support", feature = "test-support")
+    any(
+        test,
+        feature = "bench-support",
+        feature = "test-support",
+        feature = "offscreen"
+    )
 ))]
 impl WgpuHeadlessRenderer {
     pub fn new() -> anyhow::Result<Self> {
         let (context, target_format) = WgpuContext::new_headless()?;
+        Ok(Self::from_headless_context(context, target_format))
+    }
+
+    /// Creates a renderer on a device from `instance` rather than the default
+    /// Vulkan + GL instance, which has no adapter on iOS: pass a Metal instance there.
+    /// Unlike [`Self::new`], the device is not shared with other renderers.
+    #[cfg(feature = "offscreen")]
+    pub fn with_instance(instance: wgpu::Instance) -> anyhow::Result<Self> {
+        let (context, target_format) = WgpuContext::new_headless_with_instance(instance)?;
+        Ok(Self::from_headless_context(context, target_format))
+    }
+
+    /// Renders `scene` into an offscreen texture of `size` and reads it back.
+    #[cfg(feature = "offscreen")]
+    pub fn render_to_image(
+        &mut self,
+        scene: &Scene,
+        size: Size<DevicePixels>,
+    ) -> anyhow::Result<image::RgbaImage> {
+        self.render(scene, size)?;
+        self.read_image()
+    }
+
+    /// The atlas glyphs and images are rasterized into; a window drawing through
+    /// this renderer must hand it to GPUI as its sprite atlas.
+    #[cfg(feature = "offscreen")]
+    pub fn sprite_atlas(&self) -> Arc<dyn gpui::PlatformAtlas> {
+        self.core.atlas.clone()
+    }
+
+    /// The largest width or height, in device pixels, one render can target.
+    #[cfg(feature = "offscreen")]
+    pub fn max_texture_size(&self) -> u32 {
+        self.core.max_texture_size
+    }
+
+    /// Drops the textures sized to the last render (the render target and the path
+    /// intermediates), keeping the device, pipelines and atlas. The next render
+    /// recreates them at its own size.
+    #[cfg(feature = "offscreen")]
+    pub fn release_render_target(&mut self) {
+        self.render_target = None;
+        self.core.resources.invalidate_intermediate_textures();
+    }
+
+    /// Drops every glyph and image tile in [`Self::sprite_atlas`], with the bind
+    /// groups that keep their textures alive. Only call it while no window draws
+    /// through the atlas: tiles such a window already holds would dangle.
+    #[cfg(feature = "offscreen")]
+    pub fn clear_sprite_atlas(&mut self) {
+        self.core.resources.atlas_texture_bind_groups.clear();
+        self.core.atlas.clear();
+    }
+
+    fn from_headless_context(context: WgpuContext, target_format: wgpu::TextureFormat) -> Self {
         // The device may be shared with earlier renderers; observe only errors raised from
         // here on, including any while this renderer builds its pipelines.
         let observed_error_generation = context.errors().current_generation();
@@ -2331,12 +2406,12 @@ impl WgpuHeadlessRenderer {
             wgpu::CompositeAlphaMode::Opaque,
         );
 
-        Ok(Self {
+        Self {
             context,
             core,
             render_target: None,
             observed_error_generation,
-        })
+        }
     }
 
     fn ensure_render_target(&mut self, size: Size<DevicePixels>) -> anyhow::Result<()> {
@@ -2738,6 +2813,47 @@ mod tests {
 
         renderer.render_scene(&Scene::default(), device_size(16, 17))?;
         assert_ne!(target_texture(&renderer), first);
+        Ok(())
+    }
+
+    #[cfg(all(target_os = "linux", feature = "offscreen"))]
+    #[test]
+    fn headless_renderer_releases_frame_textures() -> anyhow::Result<()> {
+        let mut renderer = WgpuHeadlessRenderer::new()?;
+        let key = gpui::AtlasKey::Image(gpui::RenderImageParams {
+            image_id: gpui::ImageId(1),
+            frame_index: 0,
+        });
+        let pixel = device_size(1, 1);
+        let mut build = || Ok(Some((pixel, std::borrow::Cow::Owned(vec![0, 0, 0, 255]))));
+        renderer
+            .sprite_atlas()
+            .get_or_insert_with(key.clone(), &mut build)?
+            .expect("tile should be created");
+        let mut scene = Scene::default();
+        scene.insert_primitive(solid_quad(2.0, 2.0, 4.0, 3.0, gpui::red()));
+        scene.finish();
+        renderer.render_to_image(&scene, device_size(13, 7))?;
+        assert!(renderer.render_target.is_some());
+        assert!(renderer.core.resources.path_intermediate_texture.is_some());
+
+        renderer.release_render_target();
+        assert!(renderer.render_target.is_none());
+        assert!(renderer.core.resources.path_intermediate_texture.is_none());
+        assert!(renderer.core.resources.path_msaa_texture.is_none());
+
+        renderer.clear_sprite_atlas();
+        assert!(renderer.core.resources.atlas_texture_bind_groups.is_empty());
+        let mut rebuilt = false;
+        renderer.sprite_atlas().get_or_insert_with(key, &mut || {
+            rebuilt = true;
+            build()
+        })?;
+        assert!(rebuilt, "the cleared atlas should rasterize the tile again");
+
+        // Both are recreated on demand.
+        let image = renderer.render_to_image(&scene, device_size(13, 7))?;
+        assert_pixel(&image, 3, 3, RED);
         Ok(())
     }
 

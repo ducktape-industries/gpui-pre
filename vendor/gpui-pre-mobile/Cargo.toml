@@ -153,5 +153,7 @@ debug     = true
 # instance (iOS needs Metal), and methods that release its render target and
 # clear its sprite atlas between captures. Applications that enable `offscreen`
 # must patch it the same way.
+# ducktape fork: the fork's own `vendor/gpui-pre-wgpu` carries this `offscreen` set
+# (one package of the name per git source; see README.ducktape.md).
 [patch.crates-io]
-gpui-pre-wgpu = { path = "vendor/gpui-pre-wgpu" }
+gpui-pre-wgpu = { path = "../gpui-pre-wgpu" }
