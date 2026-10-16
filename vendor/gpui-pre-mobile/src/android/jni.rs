@@ -20,7 +20,7 @@
 //!
 //! ## User entry point
 //!
-//! Applications must define:
+//! With the `native-activity` feature (on by default), applications must define:
 //!
 //! ```rust,no_run
 //! #[no_mangle]
@@ -28,6 +28,9 @@
 //!     // Initialise GPUI and run the application.
 //! }
 //! ```
+//!
+//! Without it this module keeps the JNI helpers the host-driven path
+//! (`super::host`) uses, and the library names no `android_main`.
 //!
 //! ## Event handling
 //!
@@ -50,13 +53,15 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc, OnceLock,
     },
-    time::Duration,
 };
+#[cfg(feature = "native-activity")]
+use std::time::Duration;
 
 /// Whether the deferred init-window callback has already been invoked.
 ///
 /// Reset to `false` on `TerminateWindow` so that when the surface is
 /// recreated on resume the init callbacks run again.
+#[cfg(feature = "native-activity")]
 static INIT_WINDOW_DONE: AtomicBool = AtomicBool::new(false);
 
 /// Whether the GPUI native library has completed initialization.
@@ -80,13 +85,20 @@ pub static NATIVE_INITIALIZED: AtomicBool = AtomicBool::new(false);
 ///
 /// Instead, the handlers set these flags and the main loop body
 /// processes them AFTER `poll_events` returns.
+#[cfg(feature = "native-activity")]
 static PAUSE_PENDING: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "native-activity")]
 static RESUME_PENDING: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "native-activity")]
 static TERM_WINDOW_PENDING: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "native-activity")]
 static INIT_WINDOW_PENDING: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "native-activity")]
 static WINDOW_RESIZED_PENDING: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "native-activity")]
 static CONFIG_CHANGED_PENDING: AtomicBool = AtomicBool::new(false);
 
+#[cfg(feature = "native-activity")]
 use android_activity::{AndroidApp, MainEvent, PollEvent};
 
 use super::platform::{AndroidPlatform, SharedPlatform};
@@ -231,6 +243,7 @@ pub fn find_app_class<'local>(
 /// The `AndroidApp` handle from `android-activity`.
 ///
 /// Set once in `android_main`; read-only thereafter.
+#[cfg(feature = "native-activity")]
 static ANDROID_APP: OnceLock<AndroidApp> = OnceLock::new();
 
 /// Process-global `AndroidPlatform` instance.
@@ -321,6 +334,7 @@ pub fn set_host_activity(env: &mut jni::Env<'_>, activity: &JObject<'_>) -> Resu
 }
 
 fn register_host_activity(env: &mut jni::Env<'_>, activity: &JObject<'_>) -> Result<(), String> {
+    #[cfg(feature = "native-activity")]
     if ANDROID_APP.get().is_some() {
         return Ok(());
     }
@@ -428,6 +442,7 @@ fn host_assets_in_frame(
 /// Run `f` with the app's `AssetManager`: from `android-activity`, or from the
 /// Activity passed to [`set_host_activity`] on the host-driven path.
 pub(crate) fn with_asset_manager<T>(f: impl FnOnce(&ndk::asset::AssetManager) -> T) -> Option<T> {
+    #[cfg(feature = "native-activity")]
     if let Some(app) = android_app() {
         return Some(f(&app.asset_manager()));
     }
@@ -439,10 +454,11 @@ pub(crate) fn with_asset_manager<T>(f: impl FnOnce(&ndk::asset::AssetManager) ->
 /// Uses `AndroidApp::vm_as_ptr()` from the stored `AndroidApp`.
 /// Used by `platform.rs` for JNI calls.
 pub fn java_vm() -> *mut c_void {
-    ANDROID_APP
-        .get()
-        .map(|app| app.vm_as_ptr())
-        .unwrap_or_else(|| HOST_VM.load(std::sync::atomic::Ordering::SeqCst))
+    #[cfg(feature = "native-activity")]
+    if let Some(app) = ANDROID_APP.get() {
+        return app.vm_as_ptr();
+    }
+    HOST_VM.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 /// Public accessor for the current Activity's JNI object reference.
@@ -455,21 +471,21 @@ pub fn java_vm() -> *mut c_void {
 /// Code that previously used `(*activity).clazz` should use this directly
 /// as the activity jobject.
 pub fn activity_as_ptr() -> *mut c_void {
-    ANDROID_APP
-        .get()
-        .map(|app| app.activity_as_ptr())
-        .unwrap_or_else(|| {
-            HOST_ACTIVITY
-                .lock()
-                .expect("poisoned")
-                .current
-                .as_ref()
-                .map(|activity| activity.as_raw() as *mut c_void)
-                .unwrap_or(std::ptr::null_mut())
-        })
+    #[cfg(feature = "native-activity")]
+    if let Some(app) = ANDROID_APP.get() {
+        return app.activity_as_ptr();
+    }
+    HOST_ACTIVITY
+        .lock()
+        .expect("poisoned")
+        .current
+        .as_ref()
+        .map(|activity| activity.as_raw() as *mut c_void)
+        .unwrap_or(std::ptr::null_mut())
 }
 
 /// Returns a clone of the stored `AndroidApp`, if initialised.
+#[cfg(feature = "native-activity")]
 pub fn android_app() -> Option<AndroidApp> {
     ANDROID_APP.get().cloned()
 }
@@ -510,9 +526,13 @@ pub fn shared_platform() -> Option<SharedPlatform> {
 // ── input event types ─────────────────────────────────────────────────────────
 
 /// Motion event action constants from the NDK.
+#[cfg(feature = "native-activity")]
 const AMOTION_EVENT_ACTION_DOWN: u32 = 0;
+#[cfg(feature = "native-activity")]
 const AMOTION_EVENT_ACTION_UP: u32 = 1;
+#[cfg(feature = "native-activity")]
 const AMOTION_EVENT_ACTION_MOVE: u32 = 2;
+#[cfg(feature = "native-activity")]
 const AMOTION_EVENT_ACTION_CANCEL: u32 = 3;
 
 // ── night mode query ─────────────────────────────────────────────────────────
@@ -521,19 +541,21 @@ const AMOTION_EVENT_ACTION_CANCEL: u32 = 3;
 ///
 /// Returns `true` if the system is in dark mode.
 pub fn query_night_mode_via_jni() -> bool {
-    let is_dark = if let Some(app) = android_app() {
+    #[cfg(feature = "native-activity")]
+    if let Some(app) = android_app() {
         // Build an ndk::configuration::Configuration from the app's asset manager.
         let config = ndk::configuration::Configuration::from_asset_manager(&app.asset_manager());
-        config.ui_mode_night() == ndk::configuration::UiModeNight::Yes
-    } else {
-        // No AndroidApp on the host-driven path: query the application context,
-        // independent of the last Activity registered or its local night mode.
-        match host_ui_mode() {
-            Ok(ui_mode) => is_night(ui_mode),
-            Err(err) => {
-                log::warn!("query_night_mode: cannot read uiMode, assuming Light: {err}");
-                false
-            }
+        let is_dark = config.ui_mode_night() == ndk::configuration::UiModeNight::Yes;
+        log::debug!("query_night_mode: is_dark={}", is_dark);
+        return is_dark;
+    }
+    // No AndroidApp on the host-driven path: query the application context,
+    // independent of the last Activity registered or its local night mode.
+    let is_dark = match host_ui_mode() {
+        Ok(ui_mode) => is_night(ui_mode),
+        Err(err) => {
+            log::warn!("query_night_mode: cannot read uiMode, assuming Light: {err}");
+            false
         }
     };
 
@@ -605,6 +627,7 @@ fn appearance(is_dark: bool) -> crate::android::window::WindowAppearance {
 // ── input event processing ────────────────────────────────────────────────────
 
 /// Process input events from the `AndroidApp` and dispatch them to the window.
+#[cfg(feature = "native-activity")]
 fn process_input_events(app: &AndroidApp) {
     let platform = match PLATFORM.get() {
         Some(p) => p,
@@ -794,6 +817,7 @@ fn process_input_events(app: &AndroidApp) {
 ///
 /// Called from `android_main` after the platform is initialised.
 /// Runs until the platform requests quit or the activity is destroyed.
+#[cfg(feature = "native-activity")]
 pub fn run_event_loop(app: &AndroidApp) {
     log::info!("run_event_loop: entering main loop");
 
@@ -1073,6 +1097,7 @@ pub fn run_event_loop(app: &AndroidApp) {
 }
 
 /// Pause all platform views when the app goes to background.
+#[cfg(feature = "native-activity")]
 fn pause_platform_views() {
     let _ = with_env(|env| {
         if let Ok(helper_class) = find_app_class(env, "dev.gpui.mobile.GpuiPlatformView") {
@@ -1089,6 +1114,7 @@ fn pause_platform_views() {
 }
 
 /// Resume all platform views when the app returns to foreground.
+#[cfg(feature = "native-activity")]
 fn resume_platform_views() {
     let _ = with_env(|env| {
         if let Ok(helper_class) = find_app_class(env, "dev.gpui.mobile.GpuiPlatformView") {
@@ -1105,6 +1131,7 @@ fn resume_platform_views() {
 }
 
 /// Dispose all platform views during app shutdown.
+#[cfg(feature = "native-activity")]
 fn dispose_all_platform_views() {
     let _ = with_env(|env| {
         if let Ok(helper_class) = find_app_class(env, "dev.gpui.mobile.GpuiPlatformView") {
@@ -1121,6 +1148,7 @@ fn dispose_all_platform_views() {
 }
 
 /// Handle a single `MainEvent` from `android-activity`.
+#[cfg(feature = "native-activity")]
 fn handle_main_event(_app: &AndroidApp, event: MainEvent<'_>) {
     match event {
         MainEvent::InitWindow { .. } => {
@@ -1218,6 +1246,7 @@ fn handle_main_event(_app: &AndroidApp, event: MainEvent<'_>) {
 /// Pass `0` for non-blocking, `-1` to block indefinitely.
 ///
 /// Returns `true` if the application should exit.
+#[cfg(feature = "native-activity")]
 pub fn poll_events(timeout_ms: i32) -> bool {
     if let Some(platform) = PLATFORM.get() {
         if platform.should_quit() {
@@ -1294,6 +1323,7 @@ pub fn install_panic_hook() {
 /// `run_event_loop`.  Returns a reference to the platform so the caller
 /// can register callbacks (e.g. `set_on_init_window`) before entering
 /// the event loop.
+#[cfg(feature = "native-activity")]
 pub fn init_platform(app: &AndroidApp) -> &'static Arc<AndroidPlatform> {
     let _ = ANDROID_APP.set(app.clone());
     log::info!("init_platform: stored AndroidApp");
@@ -1571,6 +1601,7 @@ pub fn hide_keyboard_android() {
         result.map_err(|e| e.to_string())?;
         Ok(())
     });
+    #[cfg(feature = "native-activity")]
     if let Some(app) = android_app() {
         app.hide_soft_input(false);
     }

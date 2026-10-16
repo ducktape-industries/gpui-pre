@@ -574,6 +574,7 @@ pub fn set_activity(
     activity: &JObject<'_>,
 ) -> Result<(), String> {
     super::jni::set_host_activity(env, activity)?;
+    #[cfg(feature = "native-activity")]
     if super::jni::android_app().is_some() {
         return Ok(());
     }
