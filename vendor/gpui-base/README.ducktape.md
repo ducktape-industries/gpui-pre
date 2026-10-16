@@ -50,6 +50,16 @@ its own edits. Now:
    so `set_value("\n")` still clears the field; a multi-line field keeps the newline. No
    single-line field ever holds a newline.
 
+A second change, "input: a placeholder colour that outlives the editor style" (the same two
+files): `InputBaseState::set_placeholder_color(Option<Hsla>, cx)`, read through
+`placeholder_color()` where the element paints the placeholder. gpui-component's `Input` sets
+the state's editor style from its theme on every render, so a colour its owner put in the
+editor style's `muted_foreground` did not last a frame; this one is kept apart from the
+editor style. `None` paints the placeholder in `muted_foreground` as before. ducktape's host
+sets it on a touch device, where a placeholder is the design's faint text and not the kit
+theme's muted text every desktop field shares. Test:
+`a_placeholder_color_outlives_the_editor_style` (`state.rs`). Offered upstream beside the first.
+
 Besides those two source files and this README, `diff -rq` against the archive lists
 `examples/ios-input/` (four files): the on-target probe, gpui-base's `Input` (or, with
 `PROBE_TEXTAREA` set, its multi-line `Textarea`) under gpui_ios on the simulator, which the

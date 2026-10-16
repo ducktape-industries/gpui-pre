@@ -389,15 +389,17 @@ Two more pieces make a text field usable under the iOS keyboard. `TextInputConfi
 (`VirtualKeyboard`: the HTML `inputmode` value set, `Text` by default) is the kind of software
 keyboard a field asks for, and `secure` says the field holds a secret; the vendored iOS backend
 maps them onto `keyboardType` and `secureTextEntry`, nothing else reads them. And `vendor/gpui-base` is gpui-base 0.7.3
-as published plus one commit, "input: the UIKit text contract": the host's `InputState` reports its
+as published plus two commits. The first, "input: the UIKit text contract": the host's `InputState` reports its
 length and editable range, takes the selection the keyboard writes, answers selection rectangles,
 returns the configuration the host set with `InputState::text_input(cfg)`, tells the platform about
 app-driven edits once per frame, and treats a software Return key's inserted newline on a
 single-line field as the Enter action (its `README.ducktape.md`). Without it no keyboard rises
-for the field at all, and with the length alone Korean doubles every syllable (S0-ios). On a bump:
+for the field at all, and with the length alone Korean doubles every syllable (S0-ios). The second keeps a placeholder colour the host sets
+(`InputState::set_placeholder_color`) apart from the editor style, which gpui-component's `Input`
+sets from its theme on every render. On a bump:
 the `VirtualKeyboard` commit is a plain pick (dropped if upstream grows an equivalent); `vendor/gpui-base`
-is a refresh from the new published gpui-base archive with that one commit re-applied, dropped when
-longbridge ships it.
+is a refresh from the new published gpui-base archive with those two commits re-applied, each dropped
+when longbridge ships it.
 
 ### Korean input's first key on macOS
 
