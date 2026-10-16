@@ -947,8 +947,8 @@ fn apply_force_width_to_layout(layout: &mut LineLayout, force_width: Pixels) {
 /// it, and the last glyph when it is the rightmost and the line ends right of it. Every glyph
 /// moves by the spacings before it and the width grows by all of them, so wrapping and hit
 /// testing, which read these positions, agree with the width. A spacing tighter than a glyph's
-/// advance takes minus that advance: the pen never runs backwards, so no glyph lies left of the
-/// one before it and the width never drops below the glyphs.
+/// advance takes minus that advance: the pen never runs backwards, so no glyph the pen advances
+/// past lies left of the one before it and the width never drops below the glyphs.
 ///
 /// A glyph the pen does not advance past (a combining mark, a zero-width character) keeps its
 /// base's place. In a left-to-right run both shapers put a mark after its base, at the base's
