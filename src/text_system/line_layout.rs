@@ -946,7 +946,9 @@ fn apply_force_width_to_layout(layout: &mut LineLayout, force_width: Pixels) {
 /// The spacing goes after each glyph the pen advances past: one whose next glyph lies right of
 /// it, and the last glyph when it is the rightmost and the line ends right of it. Every glyph
 /// moves by the spacings before it and the width grows by all of them, so wrapping and hit
-/// testing, which read these positions, agree with the width.
+/// testing, which read these positions, agree with the width. A spacing tighter than a glyph's
+/// advance takes minus that advance: the pen never runs backwards, so no glyph the pen advances
+/// past lies left of the one before it and the width never drops below the glyphs.
 ///
 /// A glyph the pen does not advance past (a combining mark, a zero-width character) keeps its
 /// base's place. In a left-to-right run both shapers put a mark after its base, at the base's
@@ -984,7 +986,7 @@ fn apply_letter_spacing(layout: &mut LineLayout, spacing: Pixels) {
 
     let mut shifts: Vec<Pixels> = Vec::with_capacity(shaped.len());
     let mut passed = px(0.);
-    for (i, &(_, index)) in shaped.iter().enumerate() {
+    for (i, &(x, index)) in shaped.iter().enumerate() {
         // a glyph the pen stops on after its base (the next one it passes comes later in the
         // text) takes its base's shift; one before its base already has it, as no spacing lies
         // between them
@@ -997,7 +999,10 @@ fn apply_letter_spacing(layout: &mut LineLayout, spacing: Pixels) {
         };
         shifts.push(shift);
         if advances[i] {
-            passed += spacing;
+            let next_x = shaped
+                .get(i + 1)
+                .map_or(layout.width, |&(next_x, _)| next_x);
+            passed += spacing.max(x - next_x);
         }
     }
     for (glyph, shift) in layout
@@ -1266,6 +1271,24 @@ mod tests {
             .clone();
         assert_eq!(tightened.width, plain.width - px(0.5) * 5.);
         assert_eq!(glyph_x_positions(&tightened), [0., 5.5, 11., 16.5, 22.]);
+    }
+
+    /// Tighter than a glyph's 6px advance, the spacing stops at it: the glyphs meet at one x
+    /// instead of running backwards, and the width is not below them.
+    #[test]
+    fn letter_spacing_never_runs_the_pen_backwards() {
+        for spacing in [px(-6.), px(-1000.), px(f32::MIN)] {
+            let layout = shaped("Facts", Some(spacing), None)
+                .unwrapped_layout
+                .clone();
+            assert_eq!(glyph_x_positions(&layout), [0.; 5], "{spacing:?}");
+            assert_eq!(layout.width, px(0.), "{spacing:?}");
+        }
+        let partly = shaped("Facts", Some(px(-4.)), None)
+            .unwrapped_layout
+            .clone();
+        assert_eq!(glyph_x_positions(&partly), [0., 2., 4., 6., 8.]);
+        assert_eq!(partly.width, px(10.));
     }
 
     #[test]
