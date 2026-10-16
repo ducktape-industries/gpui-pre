@@ -17,10 +17,12 @@ default = ["url_launcher", "shared_preferences", "path_provider",
            "battery", "share", "sensors", "webview", "file_selector", "image_picker", "camera",
            "permission_handler", "notifications", "location", "audio", "video_player",
            "clipboard", "local_auth", "in_app_review", "contacts", "maps_launcher",
-           "calendar", "deeplink", "microphone", "maps", "media_session"]
+           "calendar", "deeplink", "microphone", "maps", "media_session",
+           "native-activity"]
 url_launcher = []
 shared_preferences = []
-path_provider = []
+# its Android half reads the app's directories from `android-activity`
+path_provider = ["native-activity"]
 package_info = []
 device_info = []
 connectivity = []
@@ -48,6 +50,11 @@ calendar = []
 deeplink = []
 microphone = []
 media_session = []
+# The `android-activity` entry: its glue starts the app from a `NativeActivity` and calls
+# the application's `android_main` (`android::jni::init_platform`, `run_event_loop`).
+# An app whose own Activity drives GPUI (`android::host`) turns it off; its library then
+# names no `android_main`, which the glue would otherwise require to load.
+native-activity = ["dep:android-activity"]
 # Render GPUI windows into images (`gpui_mobile::offscreen`). Needs the vendored
 # `gpui-pre-wgpu` (see `[patch.crates-io]`), which exposes its headless renderer.
 offscreen = ["gpui_wgpu/offscreen", "dep:image"]
@@ -114,8 +121,8 @@ ndk         = { version = "0.9", features = ["nativewindow"] }
 ndk-context = "0.1"
 ndk-sys     = "0.6"
 
-# Activity glue layer
-android-activity = { version = "0.6", features = ["native-activity"] }
+# Activity glue layer (the `native-activity` feature)
+android-activity = { version = "0.6", features = ["native-activity"], optional = true }
 
 # Logging to logcat
 android_logger = "0.15"

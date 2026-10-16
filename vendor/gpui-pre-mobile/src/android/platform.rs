@@ -562,9 +562,13 @@ impl AndroidPlatform {
         // Drive the event loop.  This blocks until quit() is called or
         // the activity is destroyed.  The finish_launching callback will
         // be invoked from inside the event loop when the window is ready.
-        if let Some(app) = super::jni::android_app() {
-            super::jni::run_event_loop(&app);
-        } else {
+        #[cfg(feature = "native-activity")]
+        let driven = super::jni::android_app()
+            .map(|app| super::jni::run_event_loop(&app))
+            .is_some();
+        #[cfg(not(feature = "native-activity"))]
+        let driven = false;
+        if !driven {
             // No `AndroidApp` to drive: either headless / test mode, or the host-driven
             // entry point (`super::host`), whose render thread owns the loop and keeps
             // the app alive through `Application::run_embedded`. Invoke the callback
