@@ -336,8 +336,12 @@ backends were checked by hand (see the PR).
 `load_family`: a known color emoji face is not skipped for lacking a Latin
 `m`, so its family loads by name and stays in a caller's fallback chain.
 0.3.9 itself stopped removing such a face from the font database (zed
-d6358b2d), which was the other half of this patch through 0.3.8. See its
-`README.ducktape.md`. The app repo's `font_fallback` tests pin the behavior.
+d6358b2d), which was the other half of this patch through 0.3.8. It also
+carries gpui-mobile's `offscreen` feature (the headless renderer for
+`gpui-pre-mobile`), so the fork holds one `gpui-pre-wgpu`: with a second copy
+under `vendor/gpui-pre-mobile`, cargo picked that one for a consumer and the
+emoji drew as tofu. See its `README.ducktape.md`. The app repo's
+`font_fallback` tests pin the behavior.
 
 ### Korean and Chinese input over XIM
 
