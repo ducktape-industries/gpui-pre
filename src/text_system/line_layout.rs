@@ -613,6 +613,7 @@ impl LineLayoutCache {
         &self,
         text: Text,
         font_size: Pixels,
+        letter_spacing: Option<Pixels>,
         runs: &[FontRun],
         wrap_width: Option<Pixels>,
         max_lines: Option<usize>,
@@ -625,6 +626,7 @@ impl LineLayoutCache {
         let key = &CacheKeyRef {
             text: text.as_ref(),
             font_size,
+            letter_spacing,
             runs,
             wrap_width,
             force_width: None,
@@ -646,7 +648,8 @@ impl LineLayoutCache {
         } else {
             drop(current_frame);
             let text = SharedString::from(text);
-            let unwrapped_layout = self.layout_line::<&SharedString>(&text, font_size, runs, None);
+            let unwrapped_layout =
+                self.layout_line::<&SharedString>(&text, font_size, letter_spacing, runs, None);
             let wrap_boundaries = if let Some(wrap_width) = wrap_width {
                 unwrapped_layout.compute_wrap_boundaries(text.as_ref(), wrap_width, max_lines)
             } else {
@@ -660,6 +663,7 @@ impl LineLayoutCache {
             let key = Arc::new(CacheKey {
                 text,
                 font_size,
+                letter_spacing,
                 runs: SmallVec::from(runs),
                 wrap_width,
                 force_width: None,
@@ -679,6 +683,7 @@ impl LineLayoutCache {
         &self,
         text: Text,
         font_size: Pixels,
+        letter_spacing: Option<Pixels>,
         runs: &[FontRun],
         force_width: Option<Pixels>,
     ) -> Arc<LineLayout>
@@ -690,6 +695,7 @@ impl LineLayoutCache {
         let key = &CacheKeyRef {
             text: text.as_ref(),
             font_size,
+            letter_spacing,
             runs,
             wrap_width: None,
             force_width,
@@ -714,10 +720,14 @@ impl LineLayoutCache {
             if let Some(force_width) = force_width {
                 apply_force_width_to_layout(&mut layout, force_width);
             }
+            if let Some(letter_spacing) = letter_spacing {
+                apply_letter_spacing(&mut layout, letter_spacing);
+            }
 
             let key = Arc::new(CacheKey {
                 text,
                 font_size,
+                letter_spacing,
                 runs: SmallVec::from(runs),
                 wrap_width: None,
                 force_width,
@@ -931,6 +941,28 @@ fn apply_force_width_to_layout(layout: &mut LineLayout, force_width: Pixels) {
     }
 }
 
+/// Letter spacing, on the shaped line so every platform's shaper gets the same: each glyph the
+/// pen advances past gets `spacing` more, the line's last glyph included, so a line of `n`
+/// glyphs is `n * spacing` wider, and wrapping and hit testing, which read these positions, agree.
+/// A glyph shaped at the x of the one before it (a combining mark on its base) is not advanced
+/// past, so it stays on that glyph.
+fn apply_letter_spacing(layout: &mut LineLayout, spacing: Pixels) {
+    let mut shift = px(0.);
+    let mut shaped_x_before = None;
+    for glyph in layout.runs.iter_mut().flat_map(|run| run.glyphs.iter_mut()) {
+        let shaped_x = glyph.position.x;
+        if shaped_x_before.is_some_and(|before| shaped_x > before) {
+            shift += spacing;
+        }
+        shaped_x_before = Some(shaped_x);
+        glyph.position.x += shift;
+    }
+    if shaped_x_before.is_some_and(|before| layout.width > before) {
+        shift += spacing;
+    }
+    layout.width += shift;
+}
+
 /// A run of text with a single font.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 #[expect(missing_docs)]
@@ -947,6 +979,7 @@ trait AsCacheKeyRef {
 struct CacheKey {
     text: SharedString,
     font_size: Pixels,
+    letter_spacing: Option<Pixels>,
     runs: SmallVec<[FontRun; 1]>,
     wrap_width: Option<Pixels>,
     force_width: Option<Pixels>,
@@ -956,6 +989,7 @@ struct CacheKey {
 struct CacheKeyRef<'a> {
     text: &'a str,
     font_size: Pixels,
+    letter_spacing: Option<Pixels>,
     runs: &'a [FontRun],
     wrap_width: Option<Pixels>,
     force_width: Option<Pixels>,
@@ -1048,6 +1082,7 @@ impl AsCacheKeyRef for CacheKey {
         CacheKeyRef {
             text: &self.text,
             font_size: self.font_size,
+            letter_spacing: self.letter_spacing,
             runs: self.runs.as_slice(),
             wrap_width: self.wrap_width,
             force_width: self.force_width,
@@ -1139,6 +1174,109 @@ mod tests {
             lines("see duck://testkit-1a1ffc41/explorer/tx-00ff", 250.),
             ["see ", "duck://testkit-1a1ffc41/", "explorer/tx-00ff"]
         );
+    }
+
+    /// The test platform's shaper: one 6px cell per character at 10px.
+    fn shaped(
+        text: &str,
+        letter_spacing: Option<Pixels>,
+        wrap_width: Option<Pixels>,
+    ) -> Arc<WrappedLineLayout> {
+        let cx = crate::TestAppContext::build(crate::TestDispatcher::new(0), None);
+        let run = crate::TextRun {
+            len: text.len(),
+            ..Default::default()
+        };
+        crate::WindowTextSystem::new(cx.text_system().clone())
+            .shape_letter_spaced_text(
+                SharedString::from(text.to_string()),
+                px(10.),
+                letter_spacing,
+                &[run],
+                wrap_width,
+                None,
+            )
+            .unwrap()
+            .pop()
+            .unwrap()
+            .layout
+    }
+
+    #[test]
+    fn letter_spacing_widens_a_line_by_spacing_times_its_glyphs() {
+        let plain = shaped("Facts", None, None).unwrapped_layout.clone();
+        assert_eq!(plain.width, px(30.));
+
+        let spaced = shaped("Facts", Some(px(1.5)), None)
+            .unwrapped_layout
+            .clone();
+        assert_eq!(spaced.width, plain.width + px(1.5) * 5.);
+        assert_eq!(glyph_x_positions(&spaced), [0., 7.5, 15., 22.5, 30.]);
+
+        let tightened = shaped("Facts", Some(px(-0.5)), None)
+            .unwrapped_layout
+            .clone();
+        assert_eq!(tightened.width, plain.width - px(0.5) * 5.);
+        assert_eq!(glyph_x_positions(&tightened), [0., 5.5, 11., 16.5, 22.]);
+    }
+
+    #[test]
+    fn letter_spacing_keeps_index_for_x_and_x_for_index_inverse() {
+        let layout = shaped("Facts", Some(px(1.5)), None)
+            .unwrapped_layout
+            .clone();
+        for index in 0..layout.len {
+            let x = layout.x_for_index(index);
+            assert_eq!(layout.index_for_x(x), Some(index));
+            assert_eq!(layout.closest_index_for_x(x), index);
+            // the space after a letter is that letter's
+            assert_eq!(layout.index_for_x(x + px(6.5)), Some(index));
+        }
+        assert_eq!(layout.x_for_index(layout.len), layout.width);
+        assert_eq!(layout.index_for_x(layout.width), None);
+    }
+
+    #[test]
+    fn letter_spacing_wraps_at_the_spaced_width() {
+        // "ab cd" is 30px unspaced and 37.5px with 1.5px after each letter
+        let wrap_width = Some(px(32.));
+        assert!(shaped("ab cd", None, wrap_width).wrap_boundaries.is_empty());
+        assert_eq!(
+            shaped("ab cd", Some(px(1.5)), wrap_width)
+                .wrap_boundaries
+                .as_slice(),
+            [WrapBoundary {
+                run_ix: 0,
+                glyph_ix: 3
+            }]
+        );
+    }
+
+    #[test]
+    fn no_letter_spacing_lays_out_as_the_shaper_did() {
+        let text = "ab cd";
+        let laid_out = shaped(text, None, None).unwrapped_layout.clone();
+        let shaper = crate::NoopTextSystem.layout_line(
+            text,
+            px(10.),
+            &[FontRun {
+                len: text.len(),
+                font_id: FontId(1),
+            }],
+        );
+        assert_eq!(format!("{laid_out:?}"), format!("{shaper:?}"));
+    }
+
+    #[test]
+    fn letter_spacing_keeps_a_combining_mark_on_its_base() {
+        // Thai "กี" then a base: the mark is shaped at its base's x
+        let mut layout = make_layout(vec![glyph_at(0., 0), glyph_at(0., 3), glyph_at(8., 6)]);
+        layout.width = px(16.);
+
+        apply_letter_spacing(&mut layout, px(2.));
+
+        assert_eq!(glyph_x_positions(&layout), [0., 0., 10.]);
+        assert_eq!(layout.width, px(20.));
     }
 
     #[test]

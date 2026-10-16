@@ -700,6 +700,9 @@ impl TextLayout {
                     return size;
                 }
 
+                // ponytail: the cut below sums unspaced character advances, so a letter-spaced
+                // line that does not fit is cut up to `characters x spacing` off; give
+                // `LineWrapper::width_for_char` the spacing if a truncated spaced line shows it.
                 let mut line_wrapper = cx.text_system().line_wrapper(text_style.font(), font_size);
                 let (text, runs) = if let Some(truncate_width) = truncate_width {
                     if let Some(max_lines) = text_style.line_clamp
@@ -715,7 +718,14 @@ impl TextLayout {
                         )
                     } else if let Some(unclipped) = window
                         .text_system()
-                        .shape_text(text.clone(), font_size, &runs, None, None)
+                        .shape_letter_spaced_text(
+                            text.clone(),
+                            font_size,
+                            text_style.letter_spacing,
+                            &runs,
+                            None,
+                            None,
+                        )
                         .log_err()
                         && unclipped
                             .iter()
@@ -744,9 +754,10 @@ impl TextLayout {
 
                 let Some(lines) = window
                     .text_system()
-                    .shape_text(
+                    .shape_letter_spaced_text(
                         text,
                         font_size,
+                        text_style.letter_spacing,
                         &runs,
                         wrap_width,            // Wrap if we know the width.
                         text_style.line_clamp, // Limit the number of lines if line_clamp is set.
@@ -1326,6 +1337,21 @@ mod tests {
         let _ = div().child("String".to_string());
         let _ = div().child(Cow::Borrowed("Cow"));
         let _ = div().child(SharedString::from("SharedString"));
+    }
+
+    #[crate::test]
+    fn a_letter_spaced_element_shapes_its_text_spaced(cx: &mut crate::TestAppContext) {
+        use crate::{ParentElement as _, Styled as _, div, point, px, size};
+
+        let cx = cx.add_empty_window();
+        let text = StyledText::new("Facts");
+        let layout = text.layout().clone();
+        cx.draw(point(px(0.), px(0.)), size(px(200.), px(50.)), |_, _| {
+            div().text_size(px(10.)).letter_spacing(px(1.5)).child(text)
+        });
+
+        // five 6px cells of the test platform's shaper, 1.5px after each
+        assert_eq!(layout.position_for_index(5).unwrap().x, px(37.5));
     }
 
     #[test]
