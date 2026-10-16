@@ -755,6 +755,20 @@ impl WindowTextSystem {
         wrap_width: Option<Pixels>,
         line_clamp: Option<usize>,
     ) -> Result<SmallVec<[WrappedLine; 1]>> {
+        self.shape_letter_spaced_text(text, font_size, None, runs, wrap_width, line_clamp)
+    }
+
+    /// [`Self::shape_text`] with `letter_spacing` added after each letter, as CSS
+    /// `letter-spacing`; `shape_text` keeps its signature so no caller of it changes.
+    pub(crate) fn shape_letter_spaced_text(
+        &self,
+        text: SharedString,
+        font_size: Pixels,
+        letter_spacing: Option<Pixels>,
+        runs: &[TextRun],
+        wrap_width: Option<Pixels>,
+        line_clamp: Option<usize>,
+    ) -> Result<SmallVec<[WrappedLine; 1]>> {
         let mut runs = runs.iter().filter(|run| run.len > 0).cloned().peekable();
         let mut font_runs = self.font_runs_pool.lock().pop().unwrap_or_default();
 
@@ -818,6 +832,7 @@ impl WindowTextSystem {
             let layout = self.line_layout_cache.layout_wrapped_line(
                 &line_text,
                 font_size,
+                letter_spacing,
                 &font_runs,
                 wrap_width,
                 max_wrap_lines.map(|max| max.saturating_sub(wrapped_lines)),
@@ -925,6 +940,7 @@ impl WindowTextSystem {
         let layout = self.line_layout_cache.layout_line(
             &SharedString::new(text),
             font_size,
+            None,
             &font_runs,
             force_width,
         );
@@ -942,6 +958,7 @@ impl WindowTextSystem {
             .layout_line(
                 buffer,
                 font_size,
+                None,
                 &[FontRun {
                     len: buffer.len(),
                     font_id,

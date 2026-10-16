@@ -1,0 +1,42 @@
+[package]
+name = "gpui-mobile-example"
+version = "0.1.0"
+edition = "2021"
+description = "Cross-platform GPUI example app for Android and iOS"
+publish = false
+
+[lib]
+name = "gpui_mobile_example"
+crate-type = ["cdylib", "staticlib", "lib"]
+path = "src/lib.rs"
+
+[[bin]]
+name = "gpui-example"
+path = "src/main.rs"
+
+[dependencies]
+# Pin the mobile facade support without requiring a published crate.
+gpui-kit = { git = "https://github.com/longbridge/gpui-kit", rev = "efd2e672d22d3ea6b2c7061ef03c891c65bbaa4b", default-features = false, features = ["component"] }
+gpui-mobile = { package = "gpui-pre-mobile", path = "..", version = "0.1.0" }
+gpui = { package = "gpui-pre", version = "=0.3.9", default-features = false }
+reqwest_client = { package = "gpui-pre-reqwest-client", version = "=0.3.9" }
+reqwest = { package = "gpui-pre-reqwest", version = "0.12.15", default-features = false, features = ["rustls-tls"] }
+log = "0.4"
+
+[target.'cfg(target_os = "ios")'.dependencies]
+objc2 = "0.6"
+
+[target.'cfg(target_os = "android")'.dependencies]
+android_logger = "0.15"
+android-activity = { version = "0.6", features = ["native-activity"] }
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[profile.dev]
+opt-level = 0
+debug = true

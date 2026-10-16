@@ -613,6 +613,7 @@ impl LineLayoutCache {
         &self,
         text: Text,
         font_size: Pixels,
+        letter_spacing: Option<Pixels>,
         runs: &[FontRun],
         wrap_width: Option<Pixels>,
         max_lines: Option<usize>,
@@ -625,6 +626,7 @@ impl LineLayoutCache {
         let key = &CacheKeyRef {
             text: text.as_ref(),
             font_size,
+            letter_spacing,
             runs,
             wrap_width,
             force_width: None,
@@ -646,7 +648,8 @@ impl LineLayoutCache {
         } else {
             drop(current_frame);
             let text = SharedString::from(text);
-            let unwrapped_layout = self.layout_line::<&SharedString>(&text, font_size, runs, None);
+            let unwrapped_layout =
+                self.layout_line::<&SharedString>(&text, font_size, letter_spacing, runs, None);
             let wrap_boundaries = if let Some(wrap_width) = wrap_width {
                 unwrapped_layout.compute_wrap_boundaries(text.as_ref(), wrap_width, max_lines)
             } else {
@@ -660,6 +663,7 @@ impl LineLayoutCache {
             let key = Arc::new(CacheKey {
                 text,
                 font_size,
+                letter_spacing,
                 runs: SmallVec::from(runs),
                 wrap_width,
                 force_width: None,
@@ -679,6 +683,7 @@ impl LineLayoutCache {
         &self,
         text: Text,
         font_size: Pixels,
+        letter_spacing: Option<Pixels>,
         runs: &[FontRun],
         force_width: Option<Pixels>,
     ) -> Arc<LineLayout>
@@ -690,6 +695,7 @@ impl LineLayoutCache {
         let key = &CacheKeyRef {
             text: text.as_ref(),
             font_size,
+            letter_spacing,
             runs,
             wrap_width: None,
             force_width,
@@ -714,10 +720,14 @@ impl LineLayoutCache {
             if let Some(force_width) = force_width {
                 apply_force_width_to_layout(&mut layout, force_width);
             }
+            if let Some(letter_spacing) = letter_spacing {
+                apply_letter_spacing(&mut layout, letter_spacing);
+            }
 
             let key = Arc::new(CacheKey {
                 text,
                 font_size,
+                letter_spacing,
                 runs: SmallVec::from(runs),
                 wrap_width: None,
                 force_width,
@@ -931,6 +941,76 @@ fn apply_force_width_to_layout(layout: &mut LineLayout, force_width: Pixels) {
     }
 }
 
+/// Letter spacing, applied to the shaped line by one rule for every platform's shaper.
+///
+/// The spacing goes after each glyph the pen advances past: one whose next glyph lies right of
+/// it, and the last glyph when it is the rightmost and the line ends right of it. Every glyph
+/// moves by the spacings before it and the width grows by all of them, so wrapping and hit
+/// testing, which read these positions, agree with the width.
+///
+/// A glyph the pen does not advance past (a combining mark, a zero-width character) keeps its
+/// base's place. In a left-to-right run both shapers put a mark after its base, at the base's
+/// end: cosmic-text with the base's text index, CoreText with its own, later one. In a
+/// right-to-left run laid out left to right they put it before its base, at the base's x, with
+/// an index no earlier than the base's. A ligature is one glyph, so one spacing. Glyphs a shaper
+/// gives right to left (cosmic-text, for a paragraph that starts right to left) are passed by no
+/// pen move and stay as shaped.
+fn apply_letter_spacing(layout: &mut LineLayout, spacing: Pixels) {
+    let shaped: Vec<(Pixels, usize)> = layout
+        .runs
+        .iter()
+        .flat_map(|run| &run.glyphs)
+        .map(|glyph| (glyph.position.x, glyph.index))
+        .collect();
+    let Some(&(last_x, _)) = shaped.last() else {
+        return;
+    };
+    let last_is_rightmost = shaped.iter().all(|&(x, _)| x <= last_x);
+    let advances: Vec<bool> = (0..shaped.len())
+        .map(|i| match shaped.get(i + 1) {
+            Some(&(next_x, _)) => next_x > shaped[i].0,
+            None => last_is_rightmost && layout.width > last_x,
+        })
+        .collect();
+    // the text index of the next glyph after each one that the pen advances past
+    let mut next_advancing = vec![None; shaped.len()];
+    for i in (0..shaped.len() - 1).rev() {
+        next_advancing[i] = if advances[i + 1] {
+            Some(shaped[i + 1].1)
+        } else {
+            next_advancing[i + 1]
+        };
+    }
+
+    let mut shifts: Vec<Pixels> = Vec::with_capacity(shaped.len());
+    let mut passed = px(0.);
+    for (i, &(_, index)) in shaped.iter().enumerate() {
+        // a glyph the pen stops on after its base (the next one it passes comes later in the
+        // text) takes its base's shift; one before its base already has it, as no spacing lies
+        // between them
+        let after_its_base =
+            !advances[i] && i > 0 && next_advancing[i].is_none_or(|next| next > index);
+        let shift = if after_its_base {
+            shifts[i - 1]
+        } else {
+            passed
+        };
+        shifts.push(shift);
+        if advances[i] {
+            passed += spacing;
+        }
+    }
+    for (glyph, shift) in layout
+        .runs
+        .iter_mut()
+        .flat_map(|run| &mut run.glyphs)
+        .zip(shifts)
+    {
+        glyph.position.x += shift;
+    }
+    layout.width += passed;
+}
+
 /// A run of text with a single font.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 #[expect(missing_docs)]
@@ -947,6 +1027,7 @@ trait AsCacheKeyRef {
 struct CacheKey {
     text: SharedString,
     font_size: Pixels,
+    letter_spacing: Option<Pixels>,
     runs: SmallVec<[FontRun; 1]>,
     wrap_width: Option<Pixels>,
     force_width: Option<Pixels>,
@@ -956,6 +1037,7 @@ struct CacheKey {
 struct CacheKeyRef<'a> {
     text: &'a str,
     font_size: Pixels,
+    letter_spacing: Option<Pixels>,
     runs: &'a [FontRun],
     wrap_width: Option<Pixels>,
     force_width: Option<Pixels>,
@@ -1048,6 +1130,7 @@ impl AsCacheKeyRef for CacheKey {
         CacheKeyRef {
             text: &self.text,
             font_size: self.font_size,
+            letter_spacing: self.letter_spacing,
             runs: self.runs.as_slice(),
             wrap_width: self.wrap_width,
             force_width: self.force_width,
@@ -1139,6 +1222,146 @@ mod tests {
             lines("see duck://testkit-1a1ffc41/explorer/tx-00ff", 250.),
             ["see ", "duck://testkit-1a1ffc41/", "explorer/tx-00ff"]
         );
+    }
+
+    /// The test platform's shaper: one 6px cell per character at 10px.
+    fn shaped(
+        text: &str,
+        letter_spacing: Option<Pixels>,
+        wrap_width: Option<Pixels>,
+    ) -> Arc<WrappedLineLayout> {
+        let cx = crate::TestAppContext::build(crate::TestDispatcher::new(0), None);
+        let run = crate::TextRun {
+            len: text.len(),
+            ..Default::default()
+        };
+        crate::WindowTextSystem::new(cx.text_system().clone())
+            .shape_letter_spaced_text(
+                SharedString::from(text.to_string()),
+                px(10.),
+                letter_spacing,
+                &[run],
+                wrap_width,
+                None,
+            )
+            .unwrap()
+            .pop()
+            .unwrap()
+            .layout
+    }
+
+    #[test]
+    fn letter_spacing_widens_a_line_by_spacing_times_its_glyphs() {
+        let plain = shaped("Facts", None, None).unwrapped_layout.clone();
+        assert_eq!(plain.width, px(30.));
+
+        let spaced = shaped("Facts", Some(px(1.5)), None)
+            .unwrapped_layout
+            .clone();
+        assert_eq!(spaced.width, plain.width + px(1.5) * 5.);
+        assert_eq!(glyph_x_positions(&spaced), [0., 7.5, 15., 22.5, 30.]);
+
+        let tightened = shaped("Facts", Some(px(-0.5)), None)
+            .unwrapped_layout
+            .clone();
+        assert_eq!(tightened.width, plain.width - px(0.5) * 5.);
+        assert_eq!(glyph_x_positions(&tightened), [0., 5.5, 11., 16.5, 22.]);
+    }
+
+    #[test]
+    fn letter_spacing_keeps_index_for_x_and_x_for_index_inverse() {
+        let layout = shaped("Facts", Some(px(1.5)), None)
+            .unwrapped_layout
+            .clone();
+        for index in 0..layout.len {
+            let x = layout.x_for_index(index);
+            assert_eq!(layout.index_for_x(x), Some(index));
+            assert_eq!(layout.closest_index_for_x(x), index);
+            // the space after a letter is that letter's
+            assert_eq!(layout.index_for_x(x + px(6.5)), Some(index));
+        }
+        assert_eq!(layout.x_for_index(layout.len), layout.width);
+        assert_eq!(layout.index_for_x(layout.width), None);
+    }
+
+    #[test]
+    fn letter_spacing_wraps_at_the_spaced_width() {
+        // "ab cd" is 30px unspaced and 37.5px with 1.5px after each letter
+        let wrap_width = Some(px(32.));
+        assert!(shaped("ab cd", None, wrap_width).wrap_boundaries.is_empty());
+        assert_eq!(
+            shaped("ab cd", Some(px(1.5)), wrap_width)
+                .wrap_boundaries
+                .as_slice(),
+            [WrapBoundary {
+                run_ix: 0,
+                glyph_ix: 3
+            }]
+        );
+    }
+
+    #[test]
+    fn no_letter_spacing_lays_out_as_the_shaper_did() {
+        let text = "ab cd";
+        let laid_out = shaped(text, None, None).unwrapped_layout.clone();
+        let shaper = crate::NoopTextSystem.layout_line(
+            text,
+            px(10.),
+            &[FontRun {
+                len: text.len(),
+                font_id: FontId(1),
+            }],
+        );
+        assert_eq!(format!("{laid_out:?}"), format!("{shaper:?}"));
+    }
+
+    // The glyph streams below are what cosmic-text 0.19 (DejaVu Sans) and CoreText (Helvetica,
+    // its Hebrew fallback) gave for these lines at 16px, positions rounded.
+
+    #[test]
+    fn letter_spacing_keeps_a_combining_mark_with_its_base() {
+        // cosmic-text, "q\u{301}x": the mark at its base's end, with its base's index
+        let mut cosmic = make_layout(vec![glyph_at(0., 0), glyph_at(10., 0), glyph_at(10., 3)]);
+        cosmic.width = px(20.);
+        apply_letter_spacing(&mut cosmic, px(2.));
+        assert_eq!(glyph_x_positions(&cosmic), [0., 10., 12.]);
+        assert_eq!(cosmic.width, px(24.));
+
+        // CoreText, "ab\u{301}\u{301}c": each mark at its base's end, with an index of its own
+        let mut core_text = make_layout(vec![
+            glyph_at(0., 0),
+            glyph_at(9., 1),
+            glyph_at(18., 2),
+            glyph_at(18., 4),
+            glyph_at(18., 6),
+        ]);
+        core_text.width = px(26.);
+        apply_letter_spacing(&mut core_text, px(2.));
+        assert_eq!(glyph_x_positions(&core_text), [0., 11., 20., 20., 22.]);
+        assert_eq!(core_text.width, px(32.));
+
+        // a right-to-left run in a left-to-right line, "a" then a pointed shin: both shapers
+        // put the point before its base, at the base's x (CoreText with its own, later index)
+        let mut rtl_run = make_layout(vec![glyph_at(0., 0), glyph_at(10., 3), glyph_at(10., 1)]);
+        rtl_run.width = px(20.);
+        apply_letter_spacing(&mut rtl_run, px(2.));
+        assert_eq!(glyph_x_positions(&rtl_run), [0., 12., 12.]);
+        assert_eq!(rtl_run.width, px(24.));
+    }
+
+    #[test]
+    fn letter_spacing_leaves_glyphs_given_right_to_left_as_shaped() {
+        // cosmic-text gives a right-to-left paragraph's glyphs right to left: "שלום"
+        let mut layout = make_layout(vec![
+            glyph_at(24., 0),
+            glyph_at(15., 2),
+            glyph_at(11., 4),
+            glyph_at(0., 6),
+        ]);
+        layout.width = px(35.);
+        apply_letter_spacing(&mut layout, px(2.));
+        assert_eq!(glyph_x_positions(&layout), [24., 15., 11., 0.]);
+        assert_eq!(layout.width, px(35.));
     }
 
     #[test]
