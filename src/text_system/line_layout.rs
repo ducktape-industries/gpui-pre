@@ -999,7 +999,9 @@ fn apply_letter_spacing(layout: &mut LineLayout, spacing: Pixels) {
         };
         shifts.push(shift);
         if advances[i] {
-            let next_x = shaped.get(i + 1).map_or(layout.width, |&(next_x, _)| next_x);
+            let next_x = shaped
+                .get(i + 1)
+                .map_or(layout.width, |&(next_x, _)| next_x);
             passed += spacing.max(x - next_x);
         }
     }
