@@ -25,3 +25,10 @@ the name in the same git source made cargo pick one of the two for consumers.
 Drop this vendored copy when the locked upstream release loads a color emoji
 family by name and has an equivalent of `offscreen` (or `gpui-pre-mobile` no
 longer asks for it).
+
+# Unhinted glyphs
+
+`render_glyph_image` builds its swash scaler with `.hint(false)`, where 0.3.9 has
+`.hint(true)`. swash hints in skrifa's `Smooth` mode: heights and horizontal strokes snap to
+whole pixels, vertical strokes do not, so text drew about a pixel shorter with hard top and
+bottom edges (squashed bold). Layout is unhinted upstream already, so only glyph images change.

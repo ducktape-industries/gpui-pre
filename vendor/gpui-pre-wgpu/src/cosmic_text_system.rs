@@ -532,7 +532,10 @@ impl CosmicTextSystemState {
             .swash_scale_context
             .builder(font_ref)
             .size(pixel_size * params.scale_factor)
-            .hint(true)
+            // Unhinted, as Core Text draws on macOS: hinting here snapped a
+            // face's heights and horizontal strokes to whole pixels but not
+            // its vertical ones, which squashed bold text.
+            .hint(false)
             .build();
 
         let sources: &[Source] = if params.is_emoji {
