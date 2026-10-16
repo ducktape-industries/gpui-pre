@@ -5,7 +5,7 @@
 use gpui::TextAlign;
 use gpui::{
     Action, App, AppContext, Bounds, ClipboardItem, Context, Edges, Entity, EntityInputHandler,
-    EventEmitter, FocusHandle, Focusable, InteractiveElement as _, IntoElement, KeyBinding,
+    EventEmitter, FocusHandle, Focusable, Hsla, InteractiveElement as _, IntoElement, KeyBinding,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement as _, Pixels, Point,
     Render, ScrollHandle, ScrollWheelEvent, SharedString, Styled as _, Subscription,
     TextInputConfiguration, UTF16Selection, WeakFocusHandle, Window, actions, div, point,
@@ -512,6 +512,11 @@ pub struct InputBaseState<M: InputModeKind> {
     /// colours once and then never see them as unset again, which is the same
     /// freeze in a different place.
     projected_editor_style: InputEditorStyle,
+    /// The placeholder's colour when the consumer set one
+    /// ([`Self::set_placeholder_color`]); the editor style's
+    /// `muted_foreground` otherwise. Apart from the editor style, which a
+    /// component sets again from its theme on every render.
+    placeholder_color: Option<Hsla>,
 
     /// The mask pattern for formatting the input text
     pub(crate) mask_pattern: MaskPattern,
@@ -875,6 +880,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             mask_pattern_set: false,
             editor_style: InputEditorStyle::default(),
             projected_editor_style: InputEditorStyle::default(),
+            placeholder_color: None,
             diagnostic_popover: None,
             context_menu_handler: None,
             pending_context_menu: None,
@@ -968,6 +974,24 @@ impl<M: InputModeKind> InputBaseState<M> {
     pub fn set_editor_style(&mut self, style: InputEditorStyle) {
         self.editor_style = style.clone();
         self.projected_editor_style = style;
+    }
+
+    /// The placeholder's colour, kept through [`Self::set_editor_style`]:
+    /// gpui-component's `Input` sets the editor style from its theme on
+    /// every render, so a colour put there by the field's owner does not
+    /// last a frame. `None` paints it in the editor style's
+    /// `muted_foreground`, as before.
+    pub fn set_placeholder_color(&mut self, color: Option<Hsla>, cx: &mut Context<Self>) {
+        if self.placeholder_color != color {
+            self.placeholder_color = color;
+            cx.notify();
+        }
+    }
+
+    /// The colour the placeholder is painted in.
+    pub fn placeholder_color(&self) -> Hsla {
+        self.placeholder_color
+            .unwrap_or(self.editor_style.muted_foreground)
     }
 
     /// Set presentation padding for multi-line text and its scrollbar layout.
@@ -11346,6 +11370,39 @@ mod tests {
                 assert!(range_bounds.size.width >= px(0.0));
             });
         });
+    }
+
+    /// A placeholder colour the field's owner set outlives the editor style
+    /// a component sets from its theme on every render (gpui-component's
+    /// `Input`); with none, the placeholder is the style's muted text.
+    #[gpui::test]
+    fn a_placeholder_color_outlives_the_editor_style(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let mut input = None;
+        let window = cx.open_window(size(px(200.), px(40.)), |window, cx| {
+            input = Some(cx.new(|cx| crate::input::InputState::new(window, cx)));
+            gpui::EmptyView
+        });
+        let input = input.unwrap();
+        let muted = gpui::hsla(0., 0., 0.42, 1.);
+        let faint = gpui::hsla(0., 0., 0.64, 1.);
+        let themed = || InputEditorStyle {
+            muted_foreground: muted,
+            ..Default::default()
+        };
+        window
+            .update(cx, |_, _, cx| {
+                input.update(cx, |state, cx| {
+                    state.set_editor_style(themed());
+                    assert_eq!(state.placeholder_color(), muted);
+                    state.set_placeholder_color(Some(faint), cx);
+                    state.set_editor_style(themed());
+                    assert_eq!(state.placeholder_color(), faint);
+                    state.set_placeholder_color(None, cx);
+                    assert_eq!(state.placeholder_color(), muted);
+                })
+            })
+            .unwrap();
     }
 }
 
