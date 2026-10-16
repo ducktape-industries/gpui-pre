@@ -14,3 +14,10 @@ caller's fallback chain (`FontFallbacks`) drops the entry. The exemption keeps
 a color emoji family loadable by name and in the chain a caller declares.
 Drop this vendored copy when the locked upstream release loads a color emoji
 family by name.
+
+# Unhinted glyphs
+
+`render_glyph_image` builds its swash scaler with `.hint(false)`, where 0.3.9 has
+`.hint(true)`. swash hints in skrifa's `Smooth` mode: heights and horizontal strokes snap to
+whole pixels, vertical strokes do not, so text drew about a pixel shorter with hard top and
+bottom edges (squashed bold). Layout is unhinted upstream already, so only glyph images change.
