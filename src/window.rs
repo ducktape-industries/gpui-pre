@@ -26,7 +26,7 @@ use crate::{
 };
 
 use crate::gestures::{
-    CONTENT_TOUCH_DELAY, GestureTuning, RecognizedTouchGesture, TouchGestureRecognizer,
+    GestureTuning, MIN_PRESS_DURATION, RecognizedTouchGesture, TouchGestureRecognizer,
     TouchPressEvent,
 };
 use crate::interactive::TouchEvent;
@@ -1376,9 +1376,8 @@ pub struct Window {
     touch_prediction_enabled: bool,
     long_press_timer: Option<Task<()>>,
     long_press_capture: Option<EntityId>,
-    /// Counts down [`CONTENT_TOUCH_DELAY`] for a press a scrollable container
-    /// deferred.
-    touch_press_timer: Option<Task<()>>,
+    /// The touch press under way, if one is.
+    touch_press: Option<TouchPress>,
     pub(crate) refreshing: bool,
     pub(crate) activation_observers: SubscriberSet<(), AnyObserver>,
     pub(crate) focus: Option<FocusId>,
@@ -2282,7 +2281,7 @@ impl Window {
             touch_prediction_enabled: true,
             long_press_timer: None,
             long_press_capture: None,
-            touch_press_timer: None,
+            touch_press: None,
             refreshing: false,
             activation_observers: SubscriberSet::new(),
             focus: None,
@@ -2313,6 +2312,16 @@ impl Window {
     ) -> (Subscription, impl FnOnce() + use<>) {
         self.focus_listeners.insert((), value)
     }
+}
+
+/// A touch press the window is showing (see [`TouchPressEvent`]).
+struct TouchPress {
+    position: Point<Pixels>,
+    /// Counts [`MIN_PRESS_DURATION`] from touch-down; `None` once it has.
+    hold: Option<Task<()>>,
+    /// The touch lifted as a tap while `hold` still ran: the press ends when
+    /// it does.
+    lifted: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -6117,14 +6126,14 @@ impl Window {
             self.dispatch_recognized_touch_gesture(touch_drag, cx);
         }
         match (pressed_before, self.touch_gestures.pending_touch()) {
-            (None, Some((id, position))) => self.start_touch_press(id, position, cx),
-            (Some((id, position)), after) if after.is_none_or(|(now, _)| now != id) => {
+            (None, Some((_, position))) => self.start_touch_press(position, cx),
+            (Some((id, _)), after) if after.is_none_or(|(now, _)| now != id) => {
                 let phase = if event.phase == crate::TouchPhase::Ended {
                     crate::TouchPhase::Ended
                 } else {
                     crate::TouchPhase::Cancelled
                 };
-                self.end_touch_press(position, phase, cx);
+                self.end_touch_press(phase, cx);
             }
             _ => {}
         }
@@ -6199,11 +6208,7 @@ impl Window {
                     let claimed = self.default_prevented;
                     self.touch_gestures.resolve_long_press(claimed);
                     if claimed {
-                        self.end_touch_press(
-                            long_press.start_position,
-                            crate::TouchPhase::Cancelled,
-                            cx,
-                        );
+                        self.end_touch_press(crate::TouchPhase::Cancelled, cx);
                     } else {
                         self.long_press_capture = None;
                     }
@@ -6215,52 +6220,60 @@ impl Window {
         }
     }
 
-    /// Reports a touch that may become a tap as pressed. A scrollable
-    /// container under it prevents the default, deferring the look until
-    /// the touch has held still for [`CONTENT_TOUCH_DELAY`].
-    fn start_touch_press(&mut self, id: crate::TouchId, position: Point<Pixels>, cx: &mut App) {
-        self.touch_press_timer.take();
-        if self.dispatch_touch_press(position, crate::TouchPhase::Started, false, cx) {
+    /// Reports a touch that may become a tap as pressed, at once, and
+    /// starts the clock a tap's press must outlast ([`MIN_PRESS_DURATION`],
+    /// on the executor's timer like the long-press clock).
+    fn start_touch_press(&mut self, position: Point<Pixels>, cx: &mut App) {
+        // an earlier press still showing its minimum: the new one takes over
+        self.touch_press.take();
+        self.dispatch_touch_press(position, crate::TouchPhase::Started, cx);
+        let hold = self.spawn(cx, async move |cx| {
+            cx.background_executor.timer(MIN_PRESS_DURATION).await;
+            cx.update(|window, cx| window.touch_press_held_long_enough(cx))
+                .log_err();
+        });
+        self.touch_press = Some(TouchPress {
+            position,
+            hold: Some(hold),
+            lifted: false,
+        });
+    }
+
+    /// Ends the press: a cancel at once; a tap's lift once the press has
+    /// shown for its minimum.
+    fn end_touch_press(&mut self, phase: crate::TouchPhase, cx: &mut App) {
+        let Some(press) = self.touch_press.as_mut() else {
+            return;
+        };
+        if phase == crate::TouchPhase::Ended && press.hold.is_some() {
+            press.lifted = true;
             return;
         }
-        self.touch_press_timer = Some(self.spawn(cx, async move |cx| {
-            cx.background_executor.timer(CONTENT_TOUCH_DELAY).await;
-            cx.update(move |window, cx| {
-                window.touch_press_timer.take();
-                if window.touch_gestures.pending_touch().map(|(id, _)| id) == Some(id) {
-                    window.dispatch_touch_press(position, crate::TouchPhase::Started, true, cx);
-                }
-            })
-            .log_err();
-        }));
+        let position = press.position;
+        self.touch_press = None;
+        self.dispatch_touch_press(position, phase, cx);
     }
 
-    fn end_touch_press(&mut self, position: Point<Pixels>, phase: crate::TouchPhase, cx: &mut App) {
-        self.touch_press_timer.take();
-        self.dispatch_touch_press(position, phase, false, cx);
+    fn touch_press_held_long_enough(&mut self, cx: &mut App) {
+        let Some(press) = self.touch_press.as_mut() else {
+            return;
+        };
+        press.hold = None;
+        if press.lifted {
+            self.end_touch_press(crate::TouchPhase::Ended, cx);
+        }
     }
 
-    /// Dispatches one press event at the touch's start; true when a listener
-    /// let it through (no scrollable container deferred it).
     fn dispatch_touch_press(
         &mut self,
         position: Point<Pixels>,
         phase: crate::TouchPhase,
-        held: bool,
         cx: &mut App,
-    ) -> bool {
+    ) {
         self.mouse_position = position;
         cx.propagate_event = true;
         self.default_prevented = false;
-        self.dispatch_mouse_event(
-            &TouchPressEvent {
-                phase,
-                position,
-                held,
-            },
-            cx,
-        );
-        !self.default_prevented
+        self.dispatch_mouse_event(&TouchPressEvent { phase, position }, cx);
     }
 
     fn schedule_long_press_timer(&mut self, cx: &mut App) {
@@ -8303,7 +8316,7 @@ mod tests {
         Pixels, PlatformInput, Point, Render, RequestFrameOptions, ScaledPixels,
         StatefulInteractiveElement as _, Styled, TestAppContext, TouchDragEvent, TouchEvent,
         TouchId, TouchPhase, Underline, UnderlineStyle, Window, WindowAppearance, WindowOptions,
-        canvas, div, gestures::CONTENT_TOUCH_DELAY, hsla, point, px, red, size, white,
+        canvas, div, gestures::MIN_PRESS_DURATION, hsla, point, px, red, size, white,
     };
 
     #[gpui::test]
@@ -10014,8 +10027,8 @@ mod tests {
     }
 
     /// The headline: a control looks pressed while the finger is on it, from
-    /// touch-down, and the tap still clicks once, at lift, with nothing
-    /// fired before.
+    /// touch-down; the tap clicks once, at lift, with nothing fired before;
+    /// and the look stays until the press has shown for its minimum.
     #[gpui::test]
     fn a_touch_looks_pressed_from_touch_down_and_the_tap_clicks_once_at_lift(
         cx: &mut TestAppContext,
@@ -10028,13 +10041,38 @@ mod tests {
         assert_eq!(clicks.get(), 0, "clicked at touch-down");
 
         dispatch_touch(window, cx, TouchId(1), TouchPhase::Ended, 10.);
+        assert_eq!(clicks.get(), 1, "the tap did not click at lift");
+        assert!(
+            drawn_pressed(window, cx),
+            "a quick tap's press ended before its minimum"
+        );
+        cx.executor().advance_clock(MIN_PRESS_DURATION);
+        cx.executor().run_until_parked();
+        assert!(
+            !drawn_pressed(window, cx),
+            "still pressed after the minimum"
+        );
+    }
+
+    /// A tap held past the minimum ends its press at lift, not later.
+    #[gpui::test]
+    fn a_held_taps_press_ends_at_lift(cx: &mut TestAppContext) {
+        let (window, clicks) = pressed_button(cx, false, false);
+        dispatch_touch(window, cx, TouchId(1), TouchPhase::Started, 10.);
+        cx.executor().advance_clock(MIN_PRESS_DURATION * 2);
+        cx.executor().run_until_parked();
+        assert!(
+            drawn_pressed(window, cx),
+            "not pressed under the held finger"
+        );
+        dispatch_touch(window, cx, TouchId(1), TouchPhase::Ended, 10.);
         assert!(!drawn_pressed(window, cx), "still pressed after the lift");
         assert_eq!(clicks.get(), 1);
     }
 
-    /// The look leaves the moment the touch stops being a possible tap: it
-    /// pans past the slop, is cancelled, or is claimed as a long press; and
-    /// none of those click at lift.
+    /// The look leaves at once when the touch stops being a possible tap:
+    /// it pans past the slop, is cancelled, or is claimed as a long press;
+    /// and none of those click at lift.
     #[gpui::test]
     fn the_pressed_look_leaves_when_the_touch_pans_is_cancelled_or_long_presses(
         cx: &mut TestAppContext,
@@ -10066,42 +10104,33 @@ mod tests {
         }
     }
 
-    /// Inside a scrollable container the look waits for the content-touch
-    /// delay, so a scroll that begins on the button never flashes it; a
-    /// quick tap still clicks, and a held one looks pressed then clicks.
+    /// Inside a scrollable container the look shows at touch-down all the
+    /// same (React Native's `Pressable`, no `delayPressIn`): a scroll begun
+    /// on the button flashes it and takes it away; a tap clicks.
     #[gpui::test]
-    fn inside_a_scroller_the_pressed_look_waits_for_a_hold(cx: &mut TestAppContext) {
+    fn inside_a_scroller_the_pressed_look_shows_at_touch_down(cx: &mut TestAppContext) {
         let (window, clicks) = pressed_button(cx, true, false);
 
-        // a quick tap
         dispatch_touch(window, cx, TouchId(1), TouchPhase::Started, 10.);
         assert!(
-            !drawn_pressed(window, cx),
-            "pressed at touch-down inside a scroller"
+            drawn_pressed(window, cx),
+            "not pressed at touch-down inside a scroller"
         );
         dispatch_touch(window, cx, TouchId(1), TouchPhase::Ended, 10.);
-        assert!(!drawn_pressed(window, cx), "pressed after a quick tap");
-        assert_eq!(clicks.get(), 1, "a quick tap did not click");
+        assert_eq!(clicks.get(), 1, "a tap did not click");
+        cx.executor().advance_clock(MIN_PRESS_DURATION);
+        cx.executor().run_until_parked();
+        assert!(!drawn_pressed(window, cx), "still pressed after the tap");
 
-        // a held tap
         dispatch_touch(window, cx, TouchId(2), TouchPhase::Started, 10.);
-        assert!(!drawn_pressed(window, cx), "pressed before the hold");
-        cx.executor().advance_clock(CONTENT_TOUCH_DELAY);
-        cx.executor().run_until_parked();
-        assert!(drawn_pressed(window, cx), "not pressed after the hold");
-        dispatch_touch(window, cx, TouchId(2), TouchPhase::Ended, 10.);
-        assert!(!drawn_pressed(window, cx), "pressed after the lift");
-        assert_eq!(clicks.get(), 2, "a held tap did not click");
-
-        // a scroll begun on the button (last: its release flings, and the
-        // next touch would catch the fling instead of tapping)
-        dispatch_touch(window, cx, TouchId(3), TouchPhase::Started, 10.);
-        dispatch_touch(window, cx, TouchId(3), TouchPhase::Moved, 30.);
-        cx.executor().advance_clock(CONTENT_TOUCH_DELAY * 2);
-        cx.executor().run_until_parked();
-        assert!(!drawn_pressed(window, cx), "a pan showed the pressed look");
-        dispatch_touch(window, cx, TouchId(3), TouchPhase::Ended, 30.);
-        assert_eq!(clicks.get(), 2, "a pan clicked");
+        assert!(drawn_pressed(window, cx), "not pressed as the scroll began");
+        dispatch_touch(window, cx, TouchId(2), TouchPhase::Moved, 30.);
+        assert!(
+            !drawn_pressed(window, cx),
+            "still pressed once the touch scrolled"
+        );
+        dispatch_touch(window, cx, TouchId(2), TouchPhase::Ended, 30.);
+        assert_eq!(clicks.get(), 1, "a scroll clicked");
     }
 
     #[derive(Clone, Copy, PartialEq)]

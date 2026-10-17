@@ -3281,7 +3281,12 @@ impl Interactivity {
             {
                 let active_state = active_state.clone();
                 window.on_mouse_event(move |_: &MouseUpEvent, phase, window, _cx| {
-                    if phase == DispatchPhase::Capture && active_state.borrow().is_clicked() {
+                    // a tap's synthesized release leaves the touch press to
+                    // end the look, no sooner than `MIN_PRESS_DURATION`
+                    if phase == DispatchPhase::Capture
+                        && !window.last_input_was_touch()
+                        && active_state.borrow().is_clicked()
+                    {
                         *active_state.borrow_mut() = ElementClickedState::default();
                         window.refresh();
                     }
@@ -3312,15 +3317,19 @@ impl Interactivity {
             {
                 let press = press.clone();
                 window.on_mouse_event(move |_: &MouseDownEvent, phase, window, _cx| {
-                    if phase == DispatchPhase::Bubble && !window.default_prevented() {
+                    // under touch the press below owns the look: the tap
+                    // synthesized at lift must not restart it
+                    if phase == DispatchPhase::Bubble
+                        && !window.default_prevented()
+                        && !window.last_input_was_touch()
+                    {
                         press(window);
                     }
                 });
             }
 
             // A touch looks pressed from touch-down, before the tap it may
-            // become fires anything at lift; a scrollable container over it
-            // prevents the default of the first press to defer the look.
+            // become fires anything at lift, and until the press ends.
             window.on_mouse_event(move |event: &TouchPressEvent, phase, window, _cx| {
                 match event.phase {
                     TouchPhase::Started
@@ -3406,7 +3415,6 @@ impl Interactivity {
             let line_height = window.line_height();
             let hitbox = hitbox.clone();
             let current_view = window.current_view();
-            defer_touch_press_until_held(hitbox.id, window);
             window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
                 if phase == DispatchPhase::Bubble && hitbox.should_handle_scroll(window) {
                     let mut scroll_offset = scroll_offset.borrow_mut();
@@ -3714,22 +3722,6 @@ impl ElementClickedState {
     fn is_clicked(&self) -> bool {
         self.group || self.element
     }
-}
-
-/// A scrollable container holds the pressed look off a touch on its content
-/// until the touch has held still for the content-touch delay, so a scroll
-/// that begins on a control never flashes it: it prevents the default of
-/// the first [`TouchPressEvent`] and lets the held one through.
-pub(crate) fn defer_touch_press_until_held(hitbox: HitboxId, window: &mut Window) {
-    window.on_mouse_event(move |event: &TouchPressEvent, phase, window, _cx| {
-        if phase == DispatchPhase::Capture
-            && event.phase == TouchPhase::Started
-            && !event.held
-            && hitbox.is_hovered(window)
-        {
-            window.prevent_default();
-        }
-    });
 }
 
 /// Whether or not the element or a group that contains it is hovered.

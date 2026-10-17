@@ -405,19 +405,17 @@ impl MouseEvent for TouchDragEvent {}
 /// A touch that may still become a tap, from touch-down until it resolves.
 ///
 /// Its only purpose is the pressed look: `div`'s `active` style follows it
-/// as it follows a mouse button. Nothing else fires on it; mouse-down
-/// listeners still run at lift, when the touch is known to be a tap.
+/// as it follows a mouse button, from touch-down, inside a scrollable
+/// container as much as outside one (React Native's `Pressable` with no
+/// `delayPressIn`). Nothing else fires on it; mouse-down listeners still
+/// run at lift, when the touch is known to be a tap.
 ///
 /// A touch *holds* its press while it stays within
 /// [`GestureTuning::touch_slop`] of where it began: the same rule that makes
-/// a lift click. Past that it is a pan and the press is cancelled; so it is
-/// when the touch is cancelled or claimed as a long press or touch drag.
-///
-/// Inside a scrollable container the look waits for a short hold
-/// ([`CONTENT_TOUCH_DELAY`], `UIScrollView`'s `delaysContentTouches`), so a
-/// scroll that begins on a control never flashes it: the container prevents
-/// the default of the first [`TouchPhase::Started`] press, and the window
-/// sends a second one with [`Self::held`] set once the touch has stayed put.
+/// a lift click. Past that it is a pan and the press is cancelled at once;
+/// so it is when the touch is cancelled or claimed as a long press or touch
+/// drag. A tap's press instead ends no sooner than [`MIN_PRESS_DURATION`]
+/// after it began, so a quick tap still shows a visible flash.
 #[derive(Clone, Debug)]
 pub struct TouchPressEvent {
     /// [`TouchPhase::Started`] at touch-down, [`TouchPhase::Ended`] when the
@@ -426,9 +424,6 @@ pub struct TouchPressEvent {
     pub phase: TouchPhase,
     /// Where the touch began: the press stays there.
     pub position: Point<Pixels>,
-    /// True on the press sent after [`CONTENT_TOUCH_DELAY`]: the touch has
-    /// held still long enough that scrollable containers no longer defer it.
-    pub held: bool,
 }
 
 impl Sealed for TouchPressEvent {}
@@ -440,9 +435,11 @@ impl InputEvent for TouchPressEvent {
 impl GestureEvent for TouchPressEvent {}
 impl MouseEvent for TouchPressEvent {}
 
-/// How long a touch inside a scrollable container holds still before it
-/// looks pressed: `UIScrollView`'s content-touch delay.
-pub const CONTENT_TOUCH_DELAY: Duration = Duration::from_millis(150);
+/// The least time a tap's press shows, from touch-down: React Native's
+/// `Pressability` keeps a press in for `DEFAULT_MIN_PRESS_DURATION` (130 ms,
+/// `Libraries/Pressability/Pressability.js`) however soon the finger lifts.
+/// The click still fires at lift; only the look stays.
+pub const MIN_PRESS_DURATION: Duration = Duration::from_millis(130);
 
 /// A phased long-press gesture recognized from a touch.
 #[derive(Clone, Debug)]
