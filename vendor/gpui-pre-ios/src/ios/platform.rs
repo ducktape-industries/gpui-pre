@@ -157,6 +157,21 @@ impl IosPlatform {
         }
     }
 
+    /// Registers `callback` for the remote-notification device token UIKit answers after the
+    /// application calls `-[UIApplication registerForRemoteNotifications]`, or the reason it
+    /// failed (`application:didFailToRegisterForRemoteNotificationsWithError:`).
+    pub fn on_remote_notification_token(&self, callback: Box<dyn FnMut(Result<Vec<u8>, String>)>) {
+        self.0.application.remote_notification_token.set(callback);
+    }
+
+    /// Registers `callback` for a remote notification delivered to the running application
+    /// (`application:didReceiveRemoteNotification:fetchCompletionHandler:`), its payload as JSON.
+    /// The callback answers whether it handled the notification, which UIKit hears as whether new
+    /// data was fetched.
+    pub fn on_remote_notification(&self, callback: Box<dyn FnMut(String) -> bool>) {
+        self.0.application.remote_notification.set(callback);
+    }
+
     fn open_url_with_system(url: &NSURL) {
         unsafe {
             let app = UIApplication::sharedApplication(
