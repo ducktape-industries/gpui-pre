@@ -8,13 +8,14 @@ use objc2::{
     sel,
 };
 use objc2_foundation::{
-    NSDictionary, NSObject, NSObjectProtocol, NSRunLoop, NSRunLoopCommonModes, NSSet, NSString,
+    NSData, NSDictionary, NSError, NSJSONSerialization, NSObject, NSObjectProtocol, NSRunLoop,
+    NSRunLoopCommonModes, NSSet, NSString,
 };
 use objc2_quartz_core::CADisplayLink;
 use objc2_ui_kit::{
-    UIApplication, UIApplicationDelegate, UIApplicationLaunchOptionsKey, UIOpenURLContext, UIScene,
-    UISceneConfiguration, UISceneConnectionOptions, UISceneDelegate, UISceneSession, UIWindowScene,
-    UIWindowSceneDelegate,
+    UIApplication, UIApplicationDelegate, UIApplicationLaunchOptionsKey, UIBackgroundFetchResult,
+    UIOpenURLContext, UIScene, UISceneConfiguration, UISceneConnectionOptions, UISceneDelegate,
+    UISceneSession, UIWindowScene, UIWindowSceneDelegate,
 };
 use std::{
     cell::{Cell, RefCell},
@@ -29,6 +30,8 @@ pub(super) struct IosApplicationState {
     pub(super) open_urls: CallbackSlot<Box<dyn FnMut(Vec<String>)>>,
     pub(super) app_lifecycle: CallbackSlot<Box<dyn FnMut(AppLifecyclePhase)>>,
     pub(super) memory_warning: CallbackSlot<Box<dyn FnMut()>>,
+    pub(super) remote_notification_token: CallbackSlot<Box<dyn FnMut(Result<Vec<u8>, String>)>>,
+    pub(super) remote_notification: CallbackSlot<Box<dyn FnMut(String) -> bool>>,
     scene: RefCell<Option<Retained<UIWindowScene>>>,
     // The link retains its delegate target, which only weakly references this state.
     display_link: RefCell<Option<Retained<CADisplayLink>>>,
@@ -127,6 +130,18 @@ impl IosApplicationState {
 
     fn notify_memory_warning(&self) {
         self.memory_warning.with(|callback| callback());
+    }
+
+    fn notify_remote_notification_token(&self, token: Result<Vec<u8>, String>) {
+        self.remote_notification_token
+            .with(|callback| callback(token));
+    }
+
+    /// Whether the application handled the payload; without a handler it did not.
+    fn notify_remote_notification(&self, payload: String) -> bool {
+        self.remote_notification
+            .with(|callback| callback(payload))
+            .unwrap_or(false)
     }
 
     fn notify_app_lifecycle(&self, phase: AppLifecyclePhase) {
@@ -247,6 +262,74 @@ define_class!(
                     callback();
                 }
             }
+        }
+
+        // Remote notifications, once the application asks UIKit to register for them
+        // (`-[UIApplication registerForRemoteNotifications]`): the device token or why there is
+        // none, and a notification delivered to the running (or background-woken) application.
+
+        #[unsafe(method(application:didRegisterForRemoteNotificationsWithDeviceToken:))]
+        fn did_register_for_remote_notifications(
+            &self,
+            _application: &UIApplication,
+            device_token: &NSData,
+        ) {
+            if let Some(platform) = self.ivars().upgrade() {
+                platform
+                    .application
+                    .notify_remote_notification_token(Ok(device_token.to_vec()));
+            }
+        }
+
+        #[unsafe(method(application:didFailToRegisterForRemoteNotificationsWithError:))]
+        fn did_fail_to_register_for_remote_notifications(
+            &self,
+            _application: &UIApplication,
+            error: &NSError,
+        ) {
+            if let Some(platform) = self.ivars().upgrade() {
+                platform
+                    .application
+                    .notify_remote_notification_token(Err(error.localizedDescription().to_string()));
+            }
+        }
+
+        #[unsafe(method(application:didReceiveRemoteNotification:fetchCompletionHandler:))]
+        unsafe fn did_receive_remote_notification(
+            &self,
+            _application: &UIApplication,
+            user_info: &NSDictionary,
+            completion_handler: &block2::DynBlock<dyn Fn(UIBackgroundFetchResult)>,
+        ) {
+            let handled = self.ivars().upgrade().is_some_and(|platform| {
+                // A push's payload came from JSON, so it serializes back; an object JSON cannot
+                // hold (NSDate, NSData) would raise, and is checked first as Apple documents.
+                if !unsafe { NSJSONSerialization::isValidJSONObject(user_info) } {
+                    log::error!("remote notification payload is not a JSON object");
+                    return false;
+                }
+                let json = unsafe {
+                    NSJSONSerialization::dataWithJSONObject_options_error(
+                        user_info,
+                        objc2_foundation::NSJSONWritingOptions::empty(),
+                    )
+                };
+                match json {
+                    Ok(data) => {
+                        let payload = String::from_utf8_lossy(&data.to_vec()).into_owned();
+                        platform.application.notify_remote_notification(payload)
+                    }
+                    Err(error) => {
+                        log::error!("remote notification payload did not serialize: {error}");
+                        false
+                    }
+                }
+            });
+            completion_handler.call((if handled {
+                UIBackgroundFetchResult::NewData
+            } else {
+                UIBackgroundFetchResult::NoData
+            },));
         }
     }
 );
@@ -463,6 +546,33 @@ mod tests {
         state.notify_app_lifecycle(AppLifecyclePhase::Disconnected);
         state.notify_app_lifecycle(AppLifecyclePhase::Foreground);
         assert_eq!(*events.borrow(), [AppLifecyclePhase::Disconnected]);
+    }
+
+    #[test]
+    fn remote_notification_reaches_its_handler_and_is_unhandled_without_one() {
+        let state = IosApplicationState::default();
+        assert!(!state.notify_remote_notification("{}".into()));
+        let payloads = Rc::new(RefCell::new(Vec::new()));
+        state.remote_notification.set(Box::new({
+            let payloads = payloads.clone();
+            move |payload| {
+                payloads.borrow_mut().push(payload);
+                true
+            }
+        }));
+        assert!(state.notify_remote_notification("{\"a\":1}".into()));
+        assert_eq!(*payloads.borrow(), ["{\"a\":1}"]);
+        let tokens = Rc::new(RefCell::new(Vec::new()));
+        state.remote_notification_token.set(Box::new({
+            let tokens = tokens.clone();
+            move |token| tokens.borrow_mut().push(token)
+        }));
+        state.notify_remote_notification_token(Ok(vec![1, 2]));
+        state.notify_remote_notification_token(Err("no entitlement".into()));
+        assert_eq!(
+            *tokens.borrow(),
+            [Ok(vec![1, 2]), Err("no entitlement".to_string())]
+        );
     }
 
     #[test]
