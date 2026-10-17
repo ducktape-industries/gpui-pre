@@ -5,6 +5,11 @@
 //! existing click listeners and text selection work on mobile. Pans produce
 //! [`ScrollWheelEvent`](crate::ScrollWheelEvent)s, including post-release
 //! momentum. Long presses and touch drags can be claimed by element listeners.
+//!
+//! A touch that may still become a tap is a *press*: the window reports it
+//! as a [`TouchPressEvent`] from touch-down, so a control can look pressed
+//! under the finger (the `active` style) before anything fires at lift. The
+//! press ends the moment the touch stops being a possible tap.
 
 use std::collections::VecDeque;
 use std::mem;
@@ -396,6 +401,48 @@ impl InputEvent for TouchDragEvent {
 }
 impl GestureEvent for TouchDragEvent {}
 impl MouseEvent for TouchDragEvent {}
+
+/// A touch that may still become a tap, from touch-down until it resolves.
+///
+/// Its only purpose is the pressed look: `div`'s `active` style follows it
+/// as it follows a mouse button. Nothing else fires on it; mouse-down
+/// listeners still run at lift, when the touch is known to be a tap.
+///
+/// A touch *holds* its press while it stays within
+/// [`GestureTuning::touch_slop`] of where it began: the same rule that makes
+/// a lift click. Past that it is a pan and the press is cancelled; so it is
+/// when the touch is cancelled or claimed as a long press or touch drag.
+///
+/// Inside a scrollable container the look waits for a short hold
+/// ([`CONTENT_TOUCH_DELAY`], `UIScrollView`'s `delaysContentTouches`), so a
+/// scroll that begins on a control never flashes it: the container prevents
+/// the default of the first [`TouchPhase::Started`] press, and the window
+/// sends a second one with [`Self::held`] set once the touch has stayed put.
+#[derive(Clone, Debug)]
+pub struct TouchPressEvent {
+    /// [`TouchPhase::Started`] at touch-down, [`TouchPhase::Ended`] when the
+    /// touch lifts as a tap, [`TouchPhase::Cancelled`] when it becomes
+    /// anything else.
+    pub phase: TouchPhase,
+    /// Where the touch began: the press stays there.
+    pub position: Point<Pixels>,
+    /// True on the press sent after [`CONTENT_TOUCH_DELAY`]: the touch has
+    /// held still long enough that scrollable containers no longer defer it.
+    pub held: bool,
+}
+
+impl Sealed for TouchPressEvent {}
+impl InputEvent for TouchPressEvent {
+    fn to_platform_input(self) -> PlatformInput {
+        PlatformInput::TouchPress(self)
+    }
+}
+impl GestureEvent for TouchPressEvent {}
+impl MouseEvent for TouchPressEvent {}
+
+/// How long a touch inside a scrollable container holds still before it
+/// looks pressed: `UIScrollView`'s content-touch delay.
+pub const CONTENT_TOUCH_DELAY: Duration = Duration::from_millis(150);
 
 /// A phased long-press gesture recognized from a touch.
 #[derive(Clone, Debug)]
@@ -869,6 +916,14 @@ impl TouchGestureRecognizer {
             },
         }
         recognized
+    }
+
+    /// The touch that may still become a tap, and where it began.
+    pub(crate) fn pending_touch(&self) -> Option<(TouchId, Point<Pixels>)> {
+        match &self.state {
+            TouchGestureState::Pending { touch, .. } => Some((touch.id, touch.start_position)),
+            _ => None,
+        }
     }
 
     pub(crate) fn pending_long_press(&self) -> Option<(TouchId, Duration)> {
