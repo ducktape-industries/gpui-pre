@@ -5,6 +5,11 @@
 //! existing click listeners and text selection work on mobile. Pans produce
 //! [`ScrollWheelEvent`](crate::ScrollWheelEvent)s, including post-release
 //! momentum. Long presses and touch drags can be claimed by element listeners.
+//!
+//! A touch that may still become a tap is a *press*: the window reports it
+//! as a [`TouchPressEvent`] from touch-down, so a control can look pressed
+//! under the finger (the `active` style) before anything fires at lift. The
+//! press ends the moment the touch stops being a possible tap.
 
 use std::collections::VecDeque;
 use std::mem;
@@ -396,6 +401,45 @@ impl InputEvent for TouchDragEvent {
 }
 impl GestureEvent for TouchDragEvent {}
 impl MouseEvent for TouchDragEvent {}
+
+/// A touch that may still become a tap, from touch-down until it resolves.
+///
+/// Its only purpose is the pressed look: `div`'s `active` style follows it
+/// as it follows a mouse button, from touch-down, inside a scrollable
+/// container as much as outside one (React Native's `Pressable` with no
+/// `delayPressIn`). Nothing else fires on it; mouse-down listeners still
+/// run at lift, when the touch is known to be a tap.
+///
+/// A touch *holds* its press while it stays within
+/// [`GestureTuning::touch_slop`] of where it began: the same rule that makes
+/// a lift click. Past that it is a pan and the press is cancelled at once;
+/// so it is when the touch is cancelled or claimed as a long press or touch
+/// drag. A tap's press instead ends no sooner than [`MIN_PRESS_DURATION`]
+/// after it began, so a quick tap still shows a visible flash.
+#[derive(Clone, Debug)]
+pub struct TouchPressEvent {
+    /// [`TouchPhase::Started`] at touch-down, [`TouchPhase::Ended`] when the
+    /// touch lifts as a tap, [`TouchPhase::Cancelled`] when it becomes
+    /// anything else.
+    pub phase: TouchPhase,
+    /// Where the touch began: the press stays there.
+    pub position: Point<Pixels>,
+}
+
+impl Sealed for TouchPressEvent {}
+impl InputEvent for TouchPressEvent {
+    fn to_platform_input(self) -> PlatformInput {
+        PlatformInput::TouchPress(self)
+    }
+}
+impl GestureEvent for TouchPressEvent {}
+impl MouseEvent for TouchPressEvent {}
+
+/// The least time a tap's press shows, from touch-down: React Native's
+/// `Pressability` keeps a press in for `DEFAULT_MIN_PRESS_DURATION` (130 ms,
+/// `Libraries/Pressability/Pressability.js`) however soon the finger lifts.
+/// The click still fires at lift; only the look stays.
+pub const MIN_PRESS_DURATION: Duration = Duration::from_millis(130);
 
 /// A phased long-press gesture recognized from a touch.
 #[derive(Clone, Debug)]
@@ -869,6 +913,14 @@ impl TouchGestureRecognizer {
             },
         }
         recognized
+    }
+
+    /// The touch that may still become a tap, and where it began.
+    pub(crate) fn pending_touch(&self) -> Option<(TouchId, Point<Pixels>)> {
+        match &self.state {
+            TouchGestureState::Pending { touch, .. } => Some((touch.id, touch.start_position)),
+            _ => None,
+        }
     }
 
     pub(crate) fn pending_long_press(&self) -> Option<(TouchId, Duration)> {

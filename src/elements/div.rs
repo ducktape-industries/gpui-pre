@@ -24,7 +24,7 @@ use crate::{
     MouseClickEvent, MouseDownEvent, MouseExitEvent, MouseMoveEvent, MousePressureEvent,
     MouseUpEvent, OngoingScroll, Overflow, ParentElement, PinchEvent, Pixels, Point, Render,
     ScrollWheelEvent, SharedString, Size, Style, StyleRefinement, Styled, Task, TooltipId,
-    TouchPhase, Visibility, Window, WindowControlArea, point, px, size,
+    TouchPhase, TouchPressEvent, Visibility, Window, WindowControlArea, point, px, size,
 };
 use collections::HashMap;
 use gpui_util::ResultExt;
@@ -3281,34 +3281,72 @@ impl Interactivity {
             {
                 let active_state = active_state.clone();
                 window.on_mouse_event(move |_: &MouseUpEvent, phase, window, _cx| {
-                    if phase == DispatchPhase::Capture && active_state.borrow().is_clicked() {
+                    // a tap's synthesized release leaves the touch press to
+                    // end the look, no sooner than `MIN_PRESS_DURATION`
+                    if phase == DispatchPhase::Capture
+                        && !window.last_input_was_touch()
+                        && active_state.borrow().is_clicked()
+                    {
                         *active_state.borrow_mut() = ElementClickedState::default();
                         window.refresh();
                     }
                 });
             }
 
-            {
-                let active_group_hitbox = self
-                    .group_active_style
-                    .as_ref()
-                    .and_then(|group_active| GroupHitboxes::get(&group_active.group, cx));
+            let active_group_hitbox = self
+                .group_active_style
+                .as_ref()
+                .and_then(|group_active| GroupHitboxes::get(&group_active.group, cx));
+            let press = {
+                let active_state = active_state.clone();
                 let hitbox = hitbox.clone();
+                move |window: &mut Window| {
+                    let group_hovered = active_group_hitbox
+                        .is_some_and(|group_hitbox_id| group_hitbox_id.is_hovered(window));
+                    let element_hovered = hitbox.is_hovered(window);
+                    if group_hovered || element_hovered {
+                        *active_state.borrow_mut() = ElementClickedState {
+                            group: group_hovered,
+                            element: element_hovered,
+                        };
+                        window.refresh();
+                    }
+                }
+            };
+
+            {
+                let press = press.clone();
                 window.on_mouse_event(move |_: &MouseDownEvent, phase, window, _cx| {
-                    if phase == DispatchPhase::Bubble && !window.default_prevented() {
-                        let group_hovered = active_group_hitbox
-                            .is_some_and(|group_hitbox_id| group_hitbox_id.is_hovered(window));
-                        let element_hovered = hitbox.is_hovered(window);
-                        if group_hovered || element_hovered {
-                            *active_state.borrow_mut() = ElementClickedState {
-                                group: group_hovered,
-                                element: element_hovered,
-                            };
-                            window.refresh();
-                        }
+                    // under touch the press below owns the look: the tap
+                    // synthesized at lift must not restart it
+                    if phase == DispatchPhase::Bubble
+                        && !window.default_prevented()
+                        && !window.last_input_was_touch()
+                    {
+                        press(window);
                     }
                 });
             }
+
+            // A touch looks pressed from touch-down, before the tap it may
+            // become fires anything at lift, and until the press ends.
+            window.on_mouse_event(move |event: &TouchPressEvent, phase, window, _cx| {
+                match event.phase {
+                    TouchPhase::Started
+                        if phase == DispatchPhase::Bubble && !window.default_prevented() =>
+                    {
+                        press(window);
+                    }
+                    TouchPhase::Ended | TouchPhase::Cancelled
+                        if phase == DispatchPhase::Capture
+                            && active_state.borrow().is_clicked() =>
+                    {
+                        *active_state.borrow_mut() = ElementClickedState::default();
+                        window.refresh();
+                    }
+                    _ => {}
+                }
+            });
         }
     }
 
