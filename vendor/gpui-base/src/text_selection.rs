@@ -3014,15 +3014,25 @@ fn paint_text_selection(state: &Entity<WindowSelectionState>, window: &mut Windo
         }
     });
 
+    // The release ends the gesture on its bubble, which this layer hears
+    // last. A handler before it can stop the release (a button's click
+    // does), so the capture also ends it once the release is dispatched:
+    // otherwise every move after it, with no button held, goes on
+    // selecting.
     let mouse_up_state = state.downgrade();
-    window.on_mouse_event(move |_: &MouseUpEvent, phase, _, cx| {
-        if phase.bubble()
-            && let Some(state) = mouse_up_state.upgrade()
-        {
-            state.update(cx, |state, cx| {
-                state.mouse_down_prepared = false;
-                state.end(cx)
+    window.on_mouse_event(move |_: &MouseUpEvent, phase, window, cx| {
+        let Some(state) = mouse_up_state.upgrade() else {
+            return;
+        };
+        if phase.capture() {
+            let state = state.downgrade();
+            window.defer(cx, move |_, cx| {
+                if let Some(state) = state.upgrade() {
+                    end_press(&state, cx);
+                }
             });
+        } else if phase.bubble() {
+            end_press(&state, cx);
         }
     });
 
@@ -3055,6 +3065,15 @@ fn paint_text_selection(state: &Entity<WindowSelectionState>, window: &mut Windo
             });
             WindowSelectionState::resolve_content_keys(&state, cx);
         }
+    });
+}
+
+/// The press is over: the next press prepares afresh, and the gesture it
+/// began ends with its selection kept.
+fn end_press(state: &Entity<WindowSelectionState>, cx: &mut App) {
+    state.update(cx, |state, cx| {
+        state.mouse_down_prepared = false;
+        state.end(cx)
     });
 }
 
@@ -3144,6 +3163,18 @@ mod tests {
                             GlobalState::suppress_text_selection(cx);
                         }),
                 )
+        }
+    }
+
+    struct StoppedReleaseView;
+
+    impl Render for StoppedReleaseView {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().child(TextSelectionLayer).child(
+                div()
+                    .size_full()
+                    .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation()),
+            )
         }
     }
 
@@ -4563,6 +4594,34 @@ mod tests {
             assert!(GlobalState::is_text_selection_suppressed(cx));
             assert!(!TextSelection::has_selection(window, cx));
         });
+    }
+
+    #[gpui::test]
+    fn a_release_a_handler_stops_still_ends_the_press(cx: &mut TestAppContext) {
+        let (_, cx) = cx.add_window_view(|_, _| StoppedReleaseView);
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.simulate_mouse_down(
+            point(px(1.), px(1.)),
+            MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        let selecting = |cx: &mut gpui::VisualTestContext| {
+            cx.update(|window, cx| {
+                let state = live_text_selection_state(window, cx).unwrap();
+                state.read(cx).is_selecting
+            })
+        };
+        assert!(selecting(cx), "the press begins a gesture");
+        cx.simulate_mouse_up(
+            point(px(1.), px(1.)),
+            MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        assert!(!selecting(cx), "the stopped release ended it");
+        cx.simulate_mouse_move(point(px(40.), px(1.)), None, gpui::Modifiers::default());
+        assert!(!selecting(cx), "a move with no button held selects nothing");
     }
 
     #[gpui::test]
