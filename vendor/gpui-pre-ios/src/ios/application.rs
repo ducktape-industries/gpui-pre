@@ -367,10 +367,10 @@ define_class!(
         #[unsafe(method(renderFrame:))]
         fn render_frame(&self, display_link: &CADisplayLink) {
             if let Some(platform) = self.ivars().upgrade() {
+                let application = &platform.application;
+                application.with_windows(IosWindowState::request_frame);
                 let mut wanted = false;
-                platform
-                    .application
-                    .with_windows(|window| wanted |= window.request_frame());
+                application.with_windows(|window| wanted |= window.wants_frame());
                 // Nothing to draw and no window wants the next frame: no vsync wakes the
                 // main thread until one asks again (`IosWindowState::want_frame`).
                 if !wanted {

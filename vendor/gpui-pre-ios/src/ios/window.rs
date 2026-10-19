@@ -506,9 +506,9 @@ impl IosWindowState {
         }
     }
 
-    /// One display-link tick: GPUI draws if anything changed. Whether the window wants another
-    /// frame; the demand is cleared before the frame, so demand raised during it survives.
-    pub(super) fn request_frame(&self) -> bool {
+    /// One display-link tick: GPUI draws if anything changed. The demand is cleared before the
+    /// frame, so demand raised during it survives.
+    pub(super) fn request_frame(&self) {
         self.frame_wanted.set(false);
         self.request_frame_callback.with(|callback| {
             let force_render = self.force_next_frame.replace(false);
@@ -517,6 +517,9 @@ impl IosWindowState {
                 ..Default::default()
             });
         });
+    }
+
+    pub(super) fn wants_frame(&self) -> bool {
         self.frame_wanted.get()
     }
 
