@@ -35,6 +35,8 @@ pub(super) struct IosApplicationState {
     scene: RefCell<Option<Retained<UIWindowScene>>>,
     // The link retains its delegate target, which only weakly references this state.
     display_link: RefCell<Option<Retained<CADisplayLink>>>,
+    /// The scene is in the foreground: a window's frame demand may resume the link.
+    in_front: Cell<bool>,
     windows: RefCell<Vec<Weak<IosWindowState>>>,
 }
 
@@ -76,6 +78,14 @@ impl IosApplicationState {
         let display_link = self.display_link.borrow().clone();
         if let Some(display_link) = display_link {
             display_link.setPaused(paused);
+        }
+    }
+
+    /// A window wants a frame (`IosWindowState::want_frame`): the link ticks again, unless the
+    /// scene is in the background, where it stays paused until the scene comes to the front.
+    pub(super) fn resume_display_link(&self) {
+        if self.in_front.get() {
+            self.set_display_link_paused(false);
         }
     }
 
@@ -355,9 +365,17 @@ define_class!(
         }
 
         #[unsafe(method(renderFrame:))]
-        fn render_frame(&self, _display_link: &CADisplayLink) {
+        fn render_frame(&self, display_link: &CADisplayLink) {
             if let Some(platform) = self.ivars().upgrade() {
-                platform.application.with_windows(IosWindowState::request_frame);
+                let mut wanted = false;
+                platform
+                    .application
+                    .with_windows(|window| wanted |= window.request_frame());
+                // Nothing to draw and no window wants the next frame: no vsync wakes the
+                // main thread until one asks again (`IosWindowState::want_frame`).
+                if !wanted {
+                    display_link.setPaused(true);
+                }
             }
         }
     }
@@ -406,6 +424,7 @@ define_class!(
         #[unsafe(method(sceneDidDisconnect:))]
         fn did_disconnect(&self, scene: &UIScene) {
             if let Some(platform) = self.platform_for_scene(scene) {
+                platform.application.in_front.set(false);
                 platform.application.stop_display_link();
                 platform.application.scene.borrow_mut().take();
                 platform.application.notify_app_lifecycle(AppLifecyclePhase::Disconnected);
@@ -415,6 +434,8 @@ define_class!(
         #[unsafe(method(sceneWillEnterForeground:))]
         fn will_enter_foreground(&self, scene: &UIScene) {
             if let Some(platform) = self.platform_for_scene(scene) {
+                platform.application.in_front.set(true);
+                // one tick at least: it draws what changed behind, then pauses if idle
                 platform.application.set_display_link_paused(false);
                 platform.application.notify_app_lifecycle(AppLifecyclePhase::Foreground);
             }
@@ -437,6 +458,7 @@ define_class!(
         #[unsafe(method(sceneDidEnterBackground:))]
         fn did_enter_background(&self, scene: &UIScene) {
             if let Some(platform) = self.platform_for_scene(scene) {
+                platform.application.in_front.set(false);
                 platform.application.set_display_link_paused(true);
                 platform.application.notify_app_lifecycle(AppLifecyclePhase::Background);
             }

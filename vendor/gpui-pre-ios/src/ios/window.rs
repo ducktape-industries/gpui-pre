@@ -227,6 +227,9 @@ pub(crate) struct IosWindowState {
     input_handler: CallbackSlot<PlatformInputHandler>,
     request_frame_callback: CallbackSlot<Box<dyn FnMut(RequestFrameOptions)>>,
     force_next_frame: Cell<bool>,
+    /// GPUI asked for a frame since the last tick: the window was invalidated, an animation wants
+    /// its next frame, or a frame left the window dirty (`frame_waker`, `schedule_frame`).
+    frame_wanted: Cell<bool>,
     /// Callback for input events
     input_callback: CallbackSlot<Box<dyn FnMut(PlatformInput) -> DispatchEventResult>>,
     /// Callback for active status changes
@@ -345,6 +348,7 @@ impl IosWindow {
             input_handler: CallbackSlot::default(),
             request_frame_callback: CallbackSlot::default(),
             force_next_frame: Cell::new(true),
+            frame_wanted: Cell::new(false),
             input_callback: CallbackSlot::default(),
             active_status_callback: CallbackSlot::default(),
             visibility: Cell::new(WindowVisibility::Visible),
@@ -502,7 +506,10 @@ impl IosWindowState {
         }
     }
 
-    pub(super) fn request_frame(&self) {
+    /// One display-link tick: GPUI draws if anything changed. Whether the window wants another
+    /// frame; the demand is cleared before the frame, so demand raised during it survives.
+    pub(super) fn request_frame(&self) -> bool {
+        self.frame_wanted.set(false);
         self.request_frame_callback.with(|callback| {
             let force_render = self.force_next_frame.replace(false);
             callback(RequestFrameOptions {
@@ -510,6 +517,17 @@ impl IosWindowState {
                 ..Default::default()
             });
         });
+        self.frame_wanted.get()
+    }
+
+    /// GPUI wants a frame: the first demand since the last tick resumes the display link, which
+    /// pauses after a tick that left no demand (`SceneDelegate::render_frame`).
+    fn want_frame(&self) {
+        if !self.frame_wanted.replace(true)
+            && let Some(platform) = self.platform.upgrade()
+        {
+            platform.application.resume_display_link();
+        }
     }
 
     /// Query the safe area insets from the UIView.
@@ -804,6 +822,20 @@ impl PlatformWindow for IosWindow {
 
     fn on_request_frame(&self, callback: Box<dyn FnMut(RequestFrameOptions)>) {
         self.request_frame_callback.set(callback);
+    }
+
+    fn frame_waker(&self) -> Option<Rc<dyn Fn()>> {
+        // Weak: GPUI keeps the waker in the window's invalidator for the window's lifetime.
+        let window = Rc::downgrade(&self.state);
+        Some(Rc::new(move || {
+            if let Some(window) = window.upgrade() {
+                window.want_frame();
+            }
+        }))
+    }
+
+    fn schedule_frame(&self) {
+        self.state.want_frame();
     }
 
     fn on_input(&self, callback: Box<dyn FnMut(PlatformInput) -> DispatchEventResult>) {
