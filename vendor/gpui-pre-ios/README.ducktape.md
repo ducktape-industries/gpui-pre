@@ -28,6 +28,12 @@ appears.
 - `src/ios/text_input.rs`: `keyboardType` answers the fork's `TextInputConfiguration::virtual_keyboard`
   (`VirtualKeyboard` -> `UIKeyboardType`; zed answers `Default` always) and `isSecureTextEntry`
   answers its `secure` (zed has neither), and the harness test asserts both.
+- `src/ios/window.rs`, `src/ios/application.rs`: the display link is demand-driven. `IosWindow`
+  implements `frame_waker` and `schedule_frame` (zed's has neither), `renderFrame:` pauses the link
+  after a tick in which no window asked for another frame, and a window's next demand resumes it
+  while the scene is in front. Zed's link ticks every window on every vsync the whole time the app
+  is in front: ~120 main-thread wakeups a second on a still screen in the simulator (60 Hz), twice
+  that on a ProMotion iPhone; 2 a second with this (J-068).
 - this file.
 
 The rest of `src/` and `tests/` is verbatim.
