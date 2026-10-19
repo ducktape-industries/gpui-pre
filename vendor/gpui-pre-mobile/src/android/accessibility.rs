@@ -350,6 +350,7 @@ fn host_view<'local>(
     let view = env
         .call_method(&window, "getDecorView", "()Landroid/view/View;", &[])?
         .l()?;
+    #[cfg(feature = "native-activity")]
     if super::jni::android_app().is_some() {
         return Ok(view);
     }

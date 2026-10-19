@@ -3,7 +3,7 @@
 Source: longbridge/gpui-mobile at `c24a1308e1dcb47ce94d9ef8d8d05ca4d77d2aa7` (main on
 2026-10-15), the whole tree as `git archive` gives it. Not published on crates.io.
 
-Two things differ from upstream. First, `Cargo.toml` line 128:
+Three things differ from upstream. First, `Cargo.toml` line 134:
 
 ```
 accesskit_android = "0.7.5"   ->   accesskit_android = "0.9"
@@ -26,10 +26,22 @@ copies, a consumer patching `gpui-pre-wgpu` from the fork got `skipping duplicat
 and cargo took this nested copy, without the emoji change (desktop Linux emoji drew as tofu).
 When dropping this vendored tree, drop nothing from the fork's `gpui-pre-wgpu`.
 
-`diff -rq <git archive c24a130> vendor/gpui-pre-mobile` lists `Cargo.toml`, this file, and
-`Only in <archive>: vendor`.
+Third, `android-activity` is optional, behind a `native-activity` feature that is on by
+default (`Cargo.toml` and `src/android/{jni,host,platform,accessibility}.rs`). Its glue exports
+`ANativeActivity_onCreate` and calls the application's `android_main`, so any library linking
+it must define that symbol or fail to load (`dlopen`: `cannot locate symbol "android_main"`),
+even when no `NativeActivity` is declared and the app's own Activity drives GPUI through
+`android::host`. With the feature off, `jni.rs` keeps the JNI helpers `host` uses
+(`java_vm`, `activity_as_ptr`, the night mode and the asset manager read the Activity passed
+to `host::set_activity`) and leaves out `init_platform`, `run_event_loop`, `poll_events` and
+`android_app`; `path_provider`, whose Android half reads the app's directories from
+`android-activity`, turns it on. Default builds are unchanged. It needs nothing else from
+this fork and is offered to longbridge as is; drop it when upstream has it.
 
-Consumers depend on it with `default-features = false` and build Android with
+`diff -rq <git archive c24a130> vendor/gpui-pre-mobile` lists `Cargo.toml`, the four
+`src/android` files above, this file, and `Only in <archive>: vendor`.
+
+Consumers depend on it with `default-features = false` (so without `native-activity`) and build Android with
 `cargo ndk --platform 26` (below 26 the link fails on `-lnativewindow`). Its iOS half is not
 used: iOS is `vendor/gpui-pre-ios`.
 
