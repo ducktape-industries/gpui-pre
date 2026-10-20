@@ -46,6 +46,7 @@ decimal = [
 default = [
     "component",
     "assets",
+    "multithreaded",
 ]
 gpui-fast = [
     "dep:gpui-fast",
@@ -60,6 +61,10 @@ inspector = [
     "gpui-base/inspector",
     "gpui-component?/inspector",
     "gpui-fast?/inspector",
+]
+multithreaded = [
+    "gpui_platform/multithreaded",
+    "gpui_web/multithreaded",
 ]
 profiler = [
     "gpui/profiler",
@@ -465,6 +470,7 @@ features = [
     "wayland",
     "runtime_shaders",
 ]
+default-features = false
 package = "gpui-pre-platform"
 
 [target.'cfg(target_family = "wasm")'.dependencies.gpui-fast-web]
@@ -474,6 +480,7 @@ package = "gpui-fast-web"
 
 [target.'cfg(target_family = "wasm")'.dependencies.gpui_web]
 version = "=0.3.9"
+default-features = false
 package = "gpui-pre-web"
 
 [lints.clippy]
