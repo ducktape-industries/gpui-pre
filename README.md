@@ -436,3 +436,13 @@ shapes, unchanged encoding and bump checks. Consumers patch `rmp-serde` to the
 same fork revision alongside the scheduler. Guest builds additionally
 share serialization writers and use a pinned Binaryen optimizer; GPUI itself was
 not the main remaining size contributor after the JS gates removed its exports.
+
+### gpui-kit's `multithreaded` feature
+
+`vendor/gpui-kit` is gpui-kit 0.7.3 as published, with one change to its manifest: a kit
+feature `multithreaded`, on by default, that carries `multithreaded` to `gpui-pre-platform`
+and `gpui-pre-web`. Those two dependencies now come without their own default features. A
+build that keeps the kit's default features gets the same packages and the same code as
+before. A wasm build that turns the kit's defaults off leaves `wasm_thread` out, so it
+builds on a stable compiler. See its `README.ducktape.md`. Consumers patch `gpui-kit` from
+the same revision as `gpui-pre`.
