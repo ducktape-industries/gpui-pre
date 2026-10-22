@@ -65,6 +65,7 @@
 use std::{
     collections::BTreeMap,
     ffi::c_void,
+    rc::Rc,
     sync::{
         atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering},
         Arc, Mutex, OnceLock,
@@ -72,7 +73,7 @@ use std::{
     time::Duration,
 };
 
-use gpui::{App, Application, ApplicationHandle};
+use gpui::{App, Application, ApplicationHandle, Platform};
 use jni::{objects::JObject, refs::Global};
 use ndk::native_window::NativeWindow;
 
@@ -242,6 +243,23 @@ type Configure = Box<dyn FnOnce(Application) -> Application + Send>;
 
 /// Set by [`start_with_assets`], consumed when the app is built.
 static CONFIGURE: Mutex<Option<Configure>> = Mutex::new(None);
+
+/// Wraps GPUI's platform before the `Application` is built on it.
+type Wrap = Box<dyn FnOnce(Rc<dyn Platform>) -> Rc<dyn Platform> + Send>;
+
+/// Set by [`wrap_platform`], consumed when the app is built.
+static WRAP: Mutex<Option<Wrap>> = Mutex::new(None);
+
+/// Has the `Application` built on `wrap`'s answer instead of the bare `AndroidPlatform`,
+/// so a host can stand a `Platform` of its own between GPUI and the OS (an accessibility
+/// test door keeping each window's AccessKit callbacks). Call it before [`start`]; it runs
+/// once, on the render thread, when the app is built.
+pub fn wrap_platform<W>(wrap: W)
+where
+    W: FnOnce(Rc<dyn Platform>) -> Rc<dyn Platform> + Send + 'static,
+{
+    *WRAP.lock().expect("poisoned") = Some(Box::new(wrap));
+}
 
 /// GPUI's application, owned by the render thread.
 struct HostApp {
@@ -525,8 +543,11 @@ fn on_surface_created(
             log::error!("gpui-main: no launch closure for the first window");
             return;
         };
-        let mut application =
-            Application::with_platform(SharedPlatform::new(Arc::clone(platform)).into_rc());
+        let mut shared = SharedPlatform::new(Arc::clone(platform)).into_rc();
+        if let Some(wrap) = WRAP.lock().expect("poisoned").take() {
+            shared = wrap(shared);
+        }
+        let mut application = Application::with_platform(shared);
         if let Some(configure) = CONFIGURE.lock().expect("poisoned").take() {
             application = configure(application);
         }
