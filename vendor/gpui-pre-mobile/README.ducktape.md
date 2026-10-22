@@ -3,7 +3,7 @@
 Source: longbridge/gpui-mobile at `c24a1308e1dcb47ce94d9ef8d8d05ca4d77d2aa7` (main on
 2026-10-15), the whole tree as `git archive` gives it. Not published on crates.io.
 
-Two things differ from upstream. First, `Cargo.toml` line 128:
+Three things differ from upstream. First, `Cargo.toml` line 128:
 
 ```
 accesskit_android = "0.7.5"   ->   accesskit_android = "0.9"
@@ -26,7 +26,13 @@ copies, a consumer patching `gpui-pre-wgpu` from the fork got `skipping duplicat
 and cargo took this nested copy, without the emoji change (desktop Linux emoji drew as tofu).
 When dropping this vendored tree, drop nothing from the fork's `gpui-pre-wgpu`.
 
-`diff -rq <git archive c24a130> vendor/gpui-pre-mobile` lists `Cargo.toml`, this file, and
+Third, `src/android/host.rs` has `wrap_platform`: a host's wrapper stands between GPUI and
+`AndroidPlatform` when the `Application` is built (ducktape's AX test door wraps it in
+`A11yPlatform`, as its desktop and iOS starts wrap theirs; J-254). Upstream builds the
+platform inside `on_surface_created` with no such seam. It goes with J-256, when the app
+moves onto published gpui-pre.
+
+`diff -rq <git archive c24a130> vendor/gpui-pre-mobile` lists `Cargo.toml`, `src/android/host.rs`, this file, and
 `Only in <archive>: vendor`.
 
 Consumers depend on it with `default-features = false` and build Android with
